@@ -2,7 +2,7 @@ name: Merge main to feature branch
 
 on:
   schedule:
-    # Runs bi-weekly on the 1st and 15th of each month at 9:00 UTC
+    # Runs bi-weekly on Monday at 9:00 UTC (every 2 weeks)
     - cron: '0 9 1,15 * *'
   workflow_dispatch: # Allow manual trigger
 
@@ -34,23 +34,7 @@ jobs:
         run: |
           git fetch origin ${{ env.BASE_BRANCH }}
 
-      - name: Check if main has new commits
-        id: check
-        run: |
-          MERGE_BASE=$(git merge-base HEAD origin/${{ env.BASE_BRANCH }})
-          MAIN_HEAD=$(git rev-parse origin/${{ env.BASE_BRANCH }})
-          if [ "$MERGE_BASE" = "$MAIN_HEAD" ]; then
-            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Skip if already up to date
-        if: steps.check.outputs.up_to_date == 'true'
-        run: echo "Feature branch is already up to date with main. Nothing to do."
-
       - name: Attempt merge
-        if: steps.check.outputs.up_to_date == 'false'
         id: merge
         run: |
           if git merge origin/${{ env.BASE_BRANCH }} --no-edit; then
@@ -60,61 +44,54 @@ jobs:
             echo "conflict=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Push merge and create PR (no conflicts)
-        if: steps.check.outputs.up_to_date == 'false' && steps.merge.outputs.conflict == 'false'
+      - name: Push merged changes (no conflicts)
+        if: steps.merge.outputs.conflict == 'false'
+        run: |
+          # Check if there are new commits from the merge
+          if git diff --quiet HEAD origin/${{ env.FEATURE_BRANCH }}; then
+            echo "No new changes to merge. Feature branch is up to date."
+          else
+            git push origin ${{ env.FEATURE_BRANCH }}
+            echo "Successfully merged main into feature branch."
+          fi
+
+      - name: Create merge branch and PR (conflicts detected)
+        if: steps.merge.outputs.conflict == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           MERGE_BRANCH="auto/merge-main-to-feature-$(date +%Y%m%d)"
+
+          # Create a new branch from the feature branch
           git checkout -b "$MERGE_BRANCH"
           git push origin "$MERGE_BRANCH"
 
-          gh pr create \
-            --base "${{ env.FEATURE_BRANCH }}" \
-            --head "$MERGE_BRANCH" \
-            --title "chore: merge main into feature/daemonset-architecture" \
-            --body "## ✅ Clean Merge from \`main\`
+          # Create a PR with conflict information
+          PR_BODY=$(cat <<'EOF'
+          ## ⚠️ Merge Conflicts Detected
 
-          This is an automated bi-weekly merge of \`main\` into \`feature/daemonset-architecture\`.
+          This automated bi-weekly merge of `main` into `feature/daemonset-architecture` encountered conflicts.
 
-          No conflicts were detected. Please review and merge.
+          ### Action Required
+          1. Check out this branch locally
+          2. Merge `main` and resolve conflicts manually:
+             ```bash
+             git checkout $MERGE_BRANCH
+             git merge origin/main
+             # Resolve conflicts
+             git add .
+             git commit
+             git push
+             ```
+          3. Once resolved, merge this PR into `feature/daemonset-architecture`
 
           ---
-          *This PR was created automatically by the bi-weekly merge workflow.*"
-
-      - name: Create branch and PR (conflicts detected)
-        if: steps.check.outputs.up_to_date == 'false' && steps.merge.outputs.conflict == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          MERGE_BRANCH="auto/merge-main-to-feature-$(date +%Y%m%d)"
-          git checkout -b "$MERGE_BRANCH"
-          git push origin "$MERGE_BRANCH"
+          *This PR was created automatically by the bi-weekly merge workflow.*
+          EOF
+          )
 
           gh pr create \
             --base "${{ env.FEATURE_BRANCH }}" \
             --head "$MERGE_BRANCH" \
             --title "chore: merge main into feature/daemonset-architecture (conflicts)" \
-            --body "## ⚠️ Merge Conflicts Detected
-
-          This automated bi-weekly merge of \`main\` into \`feature/daemonset-architecture\` encountered conflicts.
-
-          ### Action Required
-          1. Check out this branch locally:
-             \`\`\`bash
-             git fetch origin
-             git checkout $MERGE_BRANCH
-             \`\`\`
-          2. Merge main and resolve conflicts:
-             \`\`\`bash
-             git merge origin/main
-             # Resolve conflicts in your editor
-             git add .
-             git commit
-             git push
-             \`\`\`
-          3. Once resolved, merge this PR into \`feature/daemonset-architecture\`
-
-          ---
-          *This PR was created automatically by the bi-weekly merge workflow.*" \
-            --label "merge-conflict"
+            --body "$PR_BODY"
