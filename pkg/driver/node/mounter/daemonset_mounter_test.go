@@ -2,6 +2,7 @@ package mounter_test
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -49,7 +50,7 @@ type dmTestCtx struct {
 	targetPath    string
 }
 
-func setupDM(t *testing.T) *dmTestCtx {
+func setupDM(t *testing.T, credProvider ...credentialprovider.ProviderInterface) *dmTestCtx {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -124,14 +125,21 @@ func setupDM(t *testing.T) *dmTestCtx {
 	}
 
 	t.Setenv("CONTAINER_KUBELET_PATH", kubeletPath)
-	mockCtl := gomock.NewController(t)
-	mockCredProvider := mock_credentialprovider.NewMockProviderInterface(mockCtl)
-	mockCredProvider.EXPECT().Provide(gomock.Any(), gomock.Any()).
-		Return(envprovider.Environment{}, credentialprovider.AuthenticationSourceDriver, nil).
-		AnyTimes()
-	mockCredProvider.EXPECT().Cleanup(gomock.Any()).Return(nil).AnyTimes()
 
-	dm := mounter.NewDaemonsetMounter(client, nodeName, mpmounter.NewWithMount(fakeMounter), mockCredProvider, mountSyscall)
+	var cp credentialprovider.ProviderInterface
+	if len(credProvider) > 0 && credProvider[0] != nil {
+		cp = credProvider[0]
+	} else {
+		mockCtl := gomock.NewController(t)
+		mockCP := mock_credentialprovider.NewMockProviderInterface(mockCtl)
+		mockCP.EXPECT().Provide(gomock.Any(), gomock.Any()).
+			Return(envprovider.Environment{}, credentialprovider.AuthenticationSourceDriver, nil).
+			AnyTimes()
+		mockCP.EXPECT().Cleanup(gomock.Any()).Return(nil).AnyTimes()
+		cp = mockCP
+	}
+
+	dm := mounter.NewDaemonsetMounter(client, nodeName, mpmounter.NewWithMount(fakeMounter), cp, mountSyscall)
 	err = dm.DiscoverCommDir(ctx)
 	assert.NoError(t, err)
 
@@ -274,6 +282,7 @@ func TestDaemonsetMounter(t *testing.T) {
 			// Do not register mount - simulates Mountpoint receiving fd but fails to start serving.
 
 			// Write error file to simulate Mountpoint crash
+			// TODO(vlaad): write error file atomically (open,write,rename)
 			mountError := "mount-s3 exited with code 1"
 			err := os.WriteFile(errFilePath, []byte(mountError), 0644)
 			assert.NoError(t, err)
@@ -287,6 +296,47 @@ func TestDaemonsetMounter(t *testing.T) {
 			// Can't use IsMountpoint/CheckMountpoint (didn't register mount), so we
 			// verify Unmount was called via FakeMounter log.
 			testCtx.assertUnmounted(target)
+		})
+
+		t.Run("Credentials cleaned up on mount failure", func(t *testing.T) {
+			mockCtl := gomock.NewController(t)
+			mockCredProvider := mock_credentialprovider.NewMockProviderInterface(mockCtl)
+
+			testCtx := setupDM(t, mockCredProvider)
+			target := testCtx.targetPath
+			mountId := mustGetMountId(t, target)
+
+			expectedWritePath := filepath.Join(testCtx.commDir, mountId)
+			expectedEnvPath := filepath.Join("/comm", mountId)
+
+			provideCall := mockCredProvider.EXPECT().Provide(gomock.Any(), gomock.Any()).
+				DoAndReturn(func(_ context.Context, provideCtx credentialprovider.ProvideContext) (envprovider.Environment, credentialprovider.AuthenticationSource, error) {
+					assert.Equals(t, expectedWritePath, provideCtx.WritePath)
+					assert.Equals(t, expectedEnvPath, provideCtx.EnvPath)
+					assert.Equals(t, credentialprovider.MountKindDaemonset, provideCtx.MountKind)
+					return envprovider.Environment{}, credentialprovider.AuthenticationSourceDriver, nil
+				})
+
+			mockCredProvider.EXPECT().Cleanup(gomock.Any()).After(provideCall).
+				DoAndReturn(func(cleanupCtx credentialprovider.CleanupContext) error {
+					assert.Equals(t, expectedWritePath, cleanupCtx.WritePath)
+					assert.Equals(t, credentialprovider.MountKindDaemonset, cleanupCtx.MountKind)
+					return nil
+				})
+
+			mountErr := fmt.Errorf("simulated mount failure")
+			testCtx.mountSyscall = func(target string, opts mpmounter.MountOptions) (int, error) {
+				return 0, mountErr
+			}
+
+			err := testCtx.dm.Mount(testCtx.ctx, testCtx.bucketName, target, credentialprovider.ProvideContext{
+				WorkloadPodID: testCtx.podUID,
+				VolumeID:      testCtx.volumeID,
+			}, mountpoint.ParseArgs(nil), "", nil)
+			if err == nil {
+				t.Fatal("mount should fail")
+			}
+			assert.Contains(t, err.Error(), "simulated mount failure")
 		})
 	})
 
