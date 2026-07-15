@@ -13,8 +13,8 @@
 //
 // Mount:
 //
-//	IsMountPoint -> GetCommDir -> Mount (FUSE) -> Send -> waitForMount
-//	Stale path? -> store nil, signal rediscoverCh, return error
+//	IsMountPoint -> GetCommDir -> ProvideCredentials -> Mount (FUSE) -> Send -> waitForMount
+//	Stale commDir path? -> store nil, signal rediscoverCh, return error
 //
 // Background (StartCommDirWatch -> checkCommDir):
 //
@@ -122,7 +122,6 @@ func NewDaemonsetMounter(clientset kubernetes.Interface, nodeID string, mount *m
 //  4. Waits for Mountpoint to start serving (or an error)
 func (dm *DaemonsetMounter) Mount(ctx context.Context, bucketName string, target string,
 	credentialCtx credentialprovider.ProvideContext, args mountpoint.Args, fsGroup string, userEnv envprovider.Environment) error {
-
 	mountId, err := GetMountId(target)
 	if err != nil {
 		return err
@@ -135,29 +134,31 @@ func (dm *DaemonsetMounter) Mount(ctx context.Context, bucketName string, target
 		return fmt.Errorf("failed to find s3-csi-daemonset-mounter pod: %w. %s", err, helpMessageForCheckingMounterPodStatus())
 	}
 
-	// Provision credentials before the isMounted early return so republish refreshes them
-	credsEnv, err := dm.provideCredentials(ctx, commDir, mountId, &credentialCtx)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if mountSuccess {
-			return
-		}
-		if err := dm.cleanupCredentials(commDir, mountId, credentialCtx.ToCleanupCtx()); err != nil {
-			klog.Errorf("DaemonsetMounter: failed to clean up credential directory for mount %s: %v", mountId, err)
-			// TODO(vlaad): once we have UID allocation, we shouldn't return UID to the pool here, we need to cleanup creds first
-		}
-	}()
-
-	// Idempotency: if target is already a healthy Mountpoint mount, return early
-	isMounted, err := dm.IsMountPoint(target)
+	alreadyMounted, err := dm.IsMountPoint(target)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("failed to check if target %q is a mount point (mount target is possibly"+
 			" corrupted, manual pod re-creation %s might be required for mount recovery): %w",
 			target, credentialCtx.WorkloadPodID, err)
 	}
-	if isMounted {
+
+	// Cleanup provisioned credentials only if this is a new mount (not a republish) and mount failed
+	defer func() {
+		if alreadyMounted || mountSuccess {
+			return
+		}
+		if err := dm.cleanupCredentials(commDir, mountId, credentialCtx.ToCleanupCtx()); err != nil {
+			klog.Errorf("DaemonsetMounter: failed to clean up credential directory for mount %s: %v", mountId, err)
+		}
+	}()
+
+	// Provision credentials before the alreadyMounted early return so republish refreshes them
+	credsEnv, err := dm.provideCredentials(ctx, commDir, mountId, &credentialCtx)
+	if err != nil {
+		return err
+	}
+
+	// Idempotency: if target is already a healthy Mountpoint mount, return early
+	if alreadyMounted {
 		klog.V(4).Infof("DaemonsetMounter: target %s is already mounted, credentials refreshed", target)
 		mountSuccess = true
 		return nil
@@ -168,30 +169,18 @@ func (dm *DaemonsetMounter) Mount(ctx context.Context, bucketName string, target
 		return fmt.Errorf("failed to create target directory %q: %w", target, err)
 	}
 
-	// Remove old error file if exists
-	errFilePath := filepath.Join(commDir, GetErrorFileName(mountId))
-	if err = removeIfExists(errFilePath); err != nil {
-		return err
-	}
-
-	// Perform FUSE mount and send options to secondary daemonset
-	if err := dm.mountS3AtTarget(ctx, target, bucketName, args, mountId, volumeId, commDir, userEnv, credsEnv); err != nil {
-		return err
-	}
-
-	// Clean up the FUSE mount if waitForMount fails
 	defer func() {
-		if !mountSuccess {
-			// TODO(vlaad): might leak a mount, implement periodic stale mount cleanup
-			if umErr := dm.mount.Unmount(target); umErr != nil {
-				klog.Errorf("Failed to unmount %q during cleanup: %v", target, umErr)
-			}
+		if mountSuccess {
+			return
+		}
+		// TODO(vlaad): might leak a mount, implement periodic stale mount cleanup
+		if umErr := dm.mount.Unmount(target); umErr != nil {
+			klog.Errorf("Failed to unmount %q during cleanup: %v", target, umErr)
 		}
 	}()
 
-	// Wait for mount readiness or error
-	err = dm.waitForMount(ctx, target, mountId, errFilePath)
-	if err != nil {
+	// Perform FUSE mount and send options to secondary daemonset
+	if err := dm.mountS3AtTarget(ctx, target, bucketName, args, mountId, volumeId, commDir, userEnv, credsEnv); err != nil {
 		return err
 	}
 
@@ -243,6 +232,11 @@ func (dm *DaemonsetMounter) IsMountPoint(target string) (bool, error) {
 func (dm *DaemonsetMounter) mountS3AtTarget(ctx context.Context, target string, bucketName string,
 	args mountpoint.Args, mountId string, volumeId string, commDir string,
 	userEnv envprovider.Environment, credsEnv envprovider.Environment) error {
+	// Remove old error file if exists
+	errFilePath := filepath.Join(commDir, GetErrorFileName(mountId))
+	if err := removeIfExists(errFilePath); err != nil {
+		return fmt.Errorf("failed to remove stale error file %q: %w", errFilePath, err)
+	}
 
 	mountOpts := mpmounter.MountOptions{
 		ReadOnly:   args.Has(mountpoint.ArgReadOnly),
@@ -254,7 +248,7 @@ func (dm *DaemonsetMounter) mountS3AtTarget(ctx context.Context, target string, 
 	}
 	defer func() {
 		if err := mpmounter.CloseFD(fd); err != nil {
-			klog.V(4).Infof("DaemonsetMounter: failed to close /dev/fuse fd %d: %v", fd, err)
+			klog.Errorf("DaemonsetMounter: failed to close /dev/fuse fd %d: %v", fd, err)
 		}
 	}()
 
@@ -296,8 +290,13 @@ func (dm *DaemonsetMounter) mountS3AtTarget(ctx context.Context, target string, 
 			default:
 			}
 		}
-		dm.mount.Unmount(target)
 		return fmt.Errorf("failed to send mount options for volume %s (mount %s): %w. %s", volumeId, mountId, err, helpMessageForGettingMounterLogs())
+	}
+
+	// Wait for mount readiness or error
+	err = dm.waitForMount(ctx, target, mountId, errFilePath)
+	if err != nil {
+		return err
 	}
 
 	return nil

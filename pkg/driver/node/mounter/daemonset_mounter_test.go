@@ -198,9 +198,24 @@ func TestDaemonsetMounter(t *testing.T) {
 			}, got)
 		})
 
-		t.Run("Does not duplicate mounts if target is already mounted", func(t *testing.T) {
-			testCtx := setupDM(t)
+		t.Run("Does not duplicate mounts if target is already mounted and refreshes credentials", func(t *testing.T) {
+			mockCtl := gomock.NewController(t)
+			mockCredProvider := mock_credentialprovider.NewMockProviderInterface(mockCtl)
+
+			testCtx := setupDM(t, mockCredProvider)
 			target := testCtx.targetPath
+			mountId := mustGetMountId(t, target)
+
+			expectedWritePath := filepath.Join(testCtx.commDir, mountId)
+			expectedEnvPath := filepath.Join("/comm", mountId)
+
+			mockCredProvider.EXPECT().Provide(gomock.Any(), gomock.Any()).
+				DoAndReturn(func(_ context.Context, provideCtx credentialprovider.ProvideContext) (envprovider.Environment, credentialprovider.AuthenticationSource, error) {
+					assert.Equals(t, expectedWritePath, provideCtx.WritePath)
+					assert.Equals(t, expectedEnvPath, provideCtx.EnvPath)
+					assert.Equals(t, credentialprovider.MountKindDaemonset, provideCtx.MountKind)
+					return envprovider.Environment{}, credentialprovider.AuthenticationSourceDriver, nil
+				})
 
 			err := os.MkdirAll(target, 0755)
 			assert.NoError(t, err)
@@ -337,13 +352,32 @@ func TestDaemonsetMounter(t *testing.T) {
 				t.Fatal("mount should fail")
 			}
 			assert.Contains(t, err.Error(), "simulated mount failure")
+
+			_, err = os.Stat(expectedWritePath)
+			assert.ErrorIs(t, err, os.ErrNotExist)
 		})
 	})
 
 	t.Run("Unmounting", func(t *testing.T) {
-		t.Run("Removes mount from target", func(t *testing.T) {
-			testCtx := setupDM(t)
+		t.Run("Removes mount from target and cleans up credentials", func(t *testing.T) {
+			mockCtl := gomock.NewController(t)
+			mockCredProvider := mock_credentialprovider.NewMockProviderInterface(mockCtl)
+
+			testCtx := setupDM(t, mockCredProvider)
 			target := testCtx.targetPath
+			mountId := mustGetMountId(t, target)
+
+			expectedWritePath := filepath.Join(testCtx.commDir, mountId)
+
+			mockCredProvider.EXPECT().Provide(gomock.Any(), gomock.Any()).
+				Return(envprovider.Environment{}, credentialprovider.AuthenticationSourceDriver, nil)
+
+			mockCredProvider.EXPECT().Cleanup(gomock.Any()).
+				DoAndReturn(func(cleanupCtx credentialprovider.CleanupContext) error {
+					assert.Equals(t, expectedWritePath, cleanupCtx.WritePath)
+					assert.Equals(t, credentialprovider.MountKindDaemonset, cleanupCtx.MountKind)
+					return nil
+				})
 
 			mountRes := make(chan error)
 			go func() {
@@ -379,6 +413,9 @@ func TestDaemonsetMounter(t *testing.T) {
 			if mounted {
 				t.Error("target should not be mounted after Unmount")
 			}
+
+			_, err = os.Stat(expectedWritePath)
+			assert.ErrorIs(t, err, os.ErrNotExist)
 		})
 	})
 

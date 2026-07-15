@@ -59,7 +59,7 @@ func (c *Provider) provideFromPod(ctx context.Context, provideCtx ProvideContext
 	}
 
 	eksToken := tokens[serviceAccountTokenAudiencePodIdentity]
-	if provideCtx.IsPodMountpoint() && eksToken == nil {
+	if !provideCtx.IsSystemDMountpoint() && eksToken == nil {
 		klog.Errorf("credentialprovider: `authenticationSource` configured to `pod` but no service account token for %s received. Please make sure to enable `podInfoOnMountCompat`, see "+podLevelCredentialsDocsPage, serviceAccountTokenAudiencePodIdentity)
 		return nil, status.Errorf(codes.InvalidArgument, "Missing service account token for %s", serviceAccountTokenAudiencePodIdentity)
 	}
