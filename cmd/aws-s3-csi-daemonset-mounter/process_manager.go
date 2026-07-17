@@ -102,6 +102,7 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 
 		if exitCode != 0 {
 			errPath := filepath.Join(pm.commDir, mountId+errorFileExt)
+			// TODO(vlaad): write error file atomically (open,write,rename)
 			if writeErr := os.WriteFile(errPath, stderr, errorFilePerm); writeErr != nil {
 				klog.Errorf("Failed to write error file for mount %s: %v", mountId, writeErr)
 			}

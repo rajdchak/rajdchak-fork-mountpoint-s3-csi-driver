@@ -2,6 +2,7 @@ package mounter_test
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -17,7 +18,10 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/mount-utils"
 
+	"github.com/golang/mock/gomock"
+
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/node/credentialprovider"
+	mock_credentialprovider "github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/node/credentialprovider/mocks"
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/node/envprovider"
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/node/mounter"
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/node/mounter/mountertest"
@@ -43,9 +47,10 @@ type dmTestCtx struct {
 	mounterPodUID string
 	kubeletPath   string
 	commDir       string
+	targetPath    string
 }
 
-func setupDM(t *testing.T) *dmTestCtx {
+func setupDM(t *testing.T, credProvider ...credentialprovider.ProviderInterface) *dmTestCtx {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -92,6 +97,8 @@ func setupDM(t *testing.T) *dmTestCtx {
 	client := fake.NewSimpleClientset(pod)
 	fakeMounter := mount.NewFakeMounter(nil)
 
+	targetPath := filepath.Join(kubeletPath, "pods", podUID, "volumes", "kubernetes.io~csi", volumeID, "mount")
+
 	testCtx := &dmTestCtx{
 		t:             t,
 		ctx:           ctx,
@@ -104,6 +111,7 @@ func setupDM(t *testing.T) *dmTestCtx {
 		mounterPodUID: mounterPodUID,
 		kubeletPath:   kubeletPath,
 		commDir:       commDir,
+		targetPath:    targetPath,
 	}
 
 	mountSyscall := func(target string, opts mpmounter.MountOptions) (int, error) {
@@ -117,7 +125,21 @@ func setupDM(t *testing.T) *dmTestCtx {
 	}
 
 	t.Setenv("CONTAINER_KUBELET_PATH", kubeletPath)
-	dm := mounter.NewDaemonsetMounter(client, nodeName, mpmounter.NewWithMount(fakeMounter), mountSyscall)
+
+	var cp credentialprovider.ProviderInterface
+	if len(credProvider) > 0 && credProvider[0] != nil {
+		cp = credProvider[0]
+	} else {
+		mockCtl := gomock.NewController(t)
+		mockCP := mock_credentialprovider.NewMockProviderInterface(mockCtl)
+		mockCP.EXPECT().Provide(gomock.Any(), gomock.Any()).
+			Return(envprovider.Environment{}, credentialprovider.AuthenticationSourceDriver, nil).
+			AnyTimes()
+		mockCP.EXPECT().Cleanup(gomock.Any()).Return(nil).AnyTimes()
+		cp = mockCP
+	}
+
+	dm := mounter.NewDaemonsetMounter(client, nodeName, mpmounter.NewWithMount(fakeMounter), cp, mountSyscall)
 	err = dm.DiscoverCommDir(ctx)
 	assert.NoError(t, err)
 
@@ -129,7 +151,7 @@ func TestDaemonsetMounter(t *testing.T) {
 	t.Run("Mounting", func(t *testing.T) {
 		t.Run("Correctly passes mount options", func(t *testing.T) {
 			testCtx := setupDM(t)
-			target := filepath.Join(testCtx.kubeletPath, "target")
+			target := testCtx.targetPath
 
 			devNull := mountertest.OpenDevNull(t)
 			testCtx.mountSyscall = func(target string, opts mpmounter.MountOptions) (int, error) {
@@ -172,13 +194,28 @@ func TestDaemonsetMounter(t *testing.T) {
 				BucketName: testCtx.bucketName,
 				Args:       []string{"--prefix=data/"},
 				Env:        env.List(),
-				VolumeId:   mounter.GetMountId(testCtx.podUID, testCtx.volumeID),
+				VolumeId:   mustGetMountId(t, testCtx.targetPath),
 			}, got)
 		})
 
-		t.Run("Does not duplicate mounts if target is already mounted", func(t *testing.T) {
-			testCtx := setupDM(t)
-			target := filepath.Join(testCtx.kubeletPath, "target")
+		t.Run("Does not duplicate mounts if target is already mounted and refreshes credentials", func(t *testing.T) {
+			mockCtl := gomock.NewController(t)
+			mockCredProvider := mock_credentialprovider.NewMockProviderInterface(mockCtl)
+
+			testCtx := setupDM(t, mockCredProvider)
+			target := testCtx.targetPath
+			mountId := mustGetMountId(t, target)
+
+			expectedWritePath := filepath.Join(testCtx.commDir, mountId)
+			expectedEnvPath := filepath.Join("/comm", mountId)
+
+			mockCredProvider.EXPECT().Provide(gomock.Any(), gomock.Any()).
+				DoAndReturn(func(_ context.Context, provideCtx credentialprovider.ProvideContext) (envprovider.Environment, credentialprovider.AuthenticationSource, error) {
+					assert.Equals(t, expectedWritePath, provideCtx.WritePath)
+					assert.Equals(t, expectedEnvPath, provideCtx.EnvPath)
+					assert.Equals(t, credentialprovider.MountKindDaemonset, provideCtx.MountKind)
+					return envprovider.Environment{}, credentialprovider.AuthenticationSourceDriver, nil
+				})
 
 			err := os.MkdirAll(target, 0755)
 			assert.NoError(t, err)
@@ -203,7 +240,7 @@ func TestDaemonsetMounter(t *testing.T) {
 
 		t.Run("Unmounts source if mounter does not receive mount options", func(t *testing.T) {
 			testCtx := setupDM(t)
-			target := filepath.Join(testCtx.kubeletPath, "target")
+			target := testCtx.targetPath
 
 			// Create socket but don't listen so no one receives mount options.
 			// mount_options.go Send -> dialWithRetry will retry until context deadline.
@@ -234,7 +271,7 @@ func TestDaemonsetMounter(t *testing.T) {
 
 		t.Run("Unmounts source if Mountpoint fails to start with error file", func(t *testing.T) {
 			testCtx := setupDM(t)
-			target := filepath.Join(testCtx.kubeletPath, "target")
+			target := testCtx.targetPath
 
 			// Skip fakeMounter - it caused waitForMount's CheckMountpoint poll to win the race over .error file poll
 			testCtx.mountSyscall = func(tgt string, opts mpmounter.MountOptions) (int, error) {
@@ -244,7 +281,7 @@ func TestDaemonsetMounter(t *testing.T) {
 			}
 
 			// Construct error file path
-			mountId := mounter.GetMountId(testCtx.podUID, testCtx.volumeID)
+			mountId := mustGetMountId(t, testCtx.targetPath)
 			errFilePath := filepath.Join(testCtx.commDir, mounter.GetErrorFileName(mountId))
 
 			mountRes := make(chan error)
@@ -260,6 +297,7 @@ func TestDaemonsetMounter(t *testing.T) {
 			// Do not register mount - simulates Mountpoint receiving fd but fails to start serving.
 
 			// Write error file to simulate Mountpoint crash
+			// TODO(vlaad): write error file atomically (open,write,rename)
 			mountError := "mount-s3 exited with code 1"
 			err := os.WriteFile(errFilePath, []byte(mountError), 0644)
 			assert.NoError(t, err)
@@ -274,12 +312,72 @@ func TestDaemonsetMounter(t *testing.T) {
 			// verify Unmount was called via FakeMounter log.
 			testCtx.assertUnmounted(target)
 		})
+
+		t.Run("Credentials cleaned up on mount failure", func(t *testing.T) {
+			mockCtl := gomock.NewController(t)
+			mockCredProvider := mock_credentialprovider.NewMockProviderInterface(mockCtl)
+
+			testCtx := setupDM(t, mockCredProvider)
+			target := testCtx.targetPath
+			mountId := mustGetMountId(t, target)
+
+			expectedWritePath := filepath.Join(testCtx.commDir, mountId)
+			expectedEnvPath := filepath.Join("/comm", mountId)
+
+			provideCall := mockCredProvider.EXPECT().Provide(gomock.Any(), gomock.Any()).
+				DoAndReturn(func(_ context.Context, provideCtx credentialprovider.ProvideContext) (envprovider.Environment, credentialprovider.AuthenticationSource, error) {
+					assert.Equals(t, expectedWritePath, provideCtx.WritePath)
+					assert.Equals(t, expectedEnvPath, provideCtx.EnvPath)
+					assert.Equals(t, credentialprovider.MountKindDaemonset, provideCtx.MountKind)
+					return envprovider.Environment{}, credentialprovider.AuthenticationSourceDriver, nil
+				})
+
+			mockCredProvider.EXPECT().Cleanup(gomock.Any()).After(provideCall).
+				DoAndReturn(func(cleanupCtx credentialprovider.CleanupContext) error {
+					assert.Equals(t, expectedWritePath, cleanupCtx.WritePath)
+					assert.Equals(t, credentialprovider.MountKindDaemonset, cleanupCtx.MountKind)
+					return nil
+				})
+
+			mountErr := fmt.Errorf("simulated mount failure")
+			testCtx.mountSyscall = func(target string, opts mpmounter.MountOptions) (int, error) {
+				return 0, mountErr
+			}
+
+			err := testCtx.dm.Mount(testCtx.ctx, testCtx.bucketName, target, credentialprovider.ProvideContext{
+				WorkloadPodID: testCtx.podUID,
+				VolumeID:      testCtx.volumeID,
+			}, mountpoint.ParseArgs(nil), "", nil)
+			if err == nil {
+				t.Fatal("mount should fail")
+			}
+			assert.Contains(t, err.Error(), "simulated mount failure")
+
+			_, err = os.Stat(expectedWritePath)
+			assert.ErrorIs(t, err, os.ErrNotExist)
+		})
 	})
 
 	t.Run("Unmounting", func(t *testing.T) {
-		t.Run("Removes mount from target", func(t *testing.T) {
-			testCtx := setupDM(t)
-			target := filepath.Join(testCtx.kubeletPath, "target")
+		t.Run("Removes mount from target and cleans up credentials", func(t *testing.T) {
+			mockCtl := gomock.NewController(t)
+			mockCredProvider := mock_credentialprovider.NewMockProviderInterface(mockCtl)
+
+			testCtx := setupDM(t, mockCredProvider)
+			target := testCtx.targetPath
+			mountId := mustGetMountId(t, target)
+
+			expectedWritePath := filepath.Join(testCtx.commDir, mountId)
+
+			mockCredProvider.EXPECT().Provide(gomock.Any(), gomock.Any()).
+				Return(envprovider.Environment{}, credentialprovider.AuthenticationSourceDriver, nil)
+
+			mockCredProvider.EXPECT().Cleanup(gomock.Any()).
+				DoAndReturn(func(cleanupCtx credentialprovider.CleanupContext) error {
+					assert.Equals(t, expectedWritePath, cleanupCtx.WritePath)
+					assert.Equals(t, credentialprovider.MountKindDaemonset, cleanupCtx.MountKind)
+					return nil
+				})
 
 			mountRes := make(chan error)
 			go func() {
@@ -315,6 +413,9 @@ func TestDaemonsetMounter(t *testing.T) {
 			if mounted {
 				t.Error("target should not be mounted after Unmount")
 			}
+
+			_, err = os.Stat(expectedWritePath)
+			assert.ErrorIs(t, err, os.ErrNotExist)
 		})
 	})
 
@@ -341,7 +442,7 @@ func TestDaemonsetMounter(t *testing.T) {
 					t.Setenv("CONTAINER_KUBELET_PATH", t.TempDir())
 
 					client := fake.NewSimpleClientset(tt.pods...)
-					dm := mounter.NewDaemonsetMounter(client, "test-node", mpmounter.NewWithMount(mount.NewFakeMounter(nil)), nil)
+					dm := mounter.NewDaemonsetMounter(client, "test-node", mpmounter.NewWithMount(mount.NewFakeMounter(nil)), nil, nil)
 
 					ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 					defer cancel()
@@ -378,7 +479,7 @@ func TestDaemonsetMounter(t *testing.T) {
 
 		t.Run("Mount fails fast when commDir not discovered", func(t *testing.T) {
 			testCtx := setupDM(t)
-			target := filepath.Join(testCtx.kubeletPath, "target")
+			target := testCtx.targetPath
 
 			// Create a fresh DM which has not discovered commDir (setupDM called dm.DiscoverCommDir(ctx))
 			// and has no StartCommDirWatch process to populate it.
@@ -386,6 +487,7 @@ func TestDaemonsetMounter(t *testing.T) {
 			testCtx.dm = mounter.NewDaemonsetMounter(
 				testCtx.client, testCtx.nodeName,
 				mpmounter.NewWithMount(testCtx.mount),
+				nil,
 				func(target string, opts mpmounter.MountOptions) (int, error) {
 					mountSyscallCalled = true
 					return 0, nil
@@ -407,7 +509,7 @@ func TestDaemonsetMounter(t *testing.T) {
 
 		t.Run("Mount nils commDir on staleness (socket not found)", func(t *testing.T) {
 			testCtx := setupDM(t)
-			target := filepath.Join(testCtx.kubeletPath, "target-timeout")
+			target := testCtx.targetPath
 
 			testCtx.mountSyscall = func(tgt string, opts mpmounter.MountOptions) (int, error) {
 				testCtx.mount.Mount("mountpoint-s3", tgt, "fuse", nil)
@@ -440,7 +542,7 @@ func TestDaemonsetMounter(t *testing.T) {
 			// it incorrectly nils commDir, all subsequent mounts fail with "mounter pod
 			// not available" until the watcher re-discovers.
 			testCtx := setupDM(t)
-			target := filepath.Join(testCtx.kubeletPath, "target-cancel")
+			target := testCtx.targetPath
 
 			testCtx.mountSyscall = func(tgt string, opts mpmounter.MountOptions) (int, error) {
 				testCtx.mount.Mount("mountpoint-s3", tgt, "fuse", nil)
@@ -484,6 +586,13 @@ func (testCtx *dmTestCtx) assertUnmounted(target string) {
 		}
 	}
 	testCtx.t.Errorf("expected Unmount to be called on %s, FakeMounter log: %v", target, testCtx.mount.GetLog())
+}
+
+func mustGetMountId(t *testing.T, target string) string {
+	t.Helper()
+	id, err := mounter.GetMountId(target)
+	assert.NoError(t, err)
+	return id
 }
 
 func mounterPod(name string, phase corev1.PodPhase) *corev1.Pod {
