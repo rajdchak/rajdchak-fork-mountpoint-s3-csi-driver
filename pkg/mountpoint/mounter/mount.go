@@ -4,6 +4,8 @@ package mounter
 import (
 	"errors"
 	"fmt"
+	"io"
+	"os"
 
 	"k8s.io/klog/v2"
 	mountutils "k8s.io/mount-utils"
@@ -117,6 +119,30 @@ func (m *Mounter) CheckMountpoint(target Target) (bool, error) {
 // FindReferencesToMountpoint returns list of references to Mountpoint at `target`.
 func (m *Mounter) FindReferencesToMountpoint(target Target) ([]string, error) {
 	return m.mount.GetMountRefs(target)
+}
+
+// IsHealthyMountpoint checks whether `target` is both a valid Mountpoint mount AND the FUSE daemon is alive.
+// A dead FUSE mount (after mounter pod crash) stays in the mount table but returns ENOTCONN on any I/O.
+func (m *Mounter) IsHealthyMountpoint(target Target) bool {
+	isMounted, err := m.CheckMountpoint(target)
+	if err != nil || !isMounted {
+		return false
+	}
+
+	// Mount entry exists in the table — verify the FUSE daemon is alive
+	// by attempting to read the directory. A dead mount returns ENOTCONN.
+	// We use Open+Readdirnames(1) to issue a single getdents syscall,
+	// avoiding enumeration of potentially millions of entries.
+	f, err := os.Open(target)
+	if err != nil {
+		return false
+	}
+	_, err = f.Readdirnames(1)
+	f.Close()
+	// err == nil means at least one entry was read (healthy).
+	// err == io.EOF means empty directory (still healthy — FUSE responded).
+	// Any other error (ENOTCONN, EIO, etc.) means dead.
+	return err == nil || errors.Is(err, io.EOF)
 }
 
 // IsMountpointCorrupted returns whether an error returned from [Mounter.CheckMountpoint]

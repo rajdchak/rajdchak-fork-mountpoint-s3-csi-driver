@@ -28,6 +28,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -36,8 +37,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
-
-	k8sstrings "k8s.io/utils/strings"
 
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/node/credentialprovider"
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/node/envprovider"
@@ -79,6 +78,12 @@ var (
 // mountSyscallFunc performs the FUSE mount and returns the fd. Injectable for testing.
 type mountSyscallFunc func(target string, opts mpmounter.MountOptions) (int, error)
 
+// bindMountSyscallFunc performs a bind mount. Injectable for testing.
+type bindMountSyscallFunc func(source, target string) error
+
+// mountInfoProviderFunc reads the kernel mount table. Injectable for testing.
+type mountInfoProviderFunc func() ([]mountInfoEntry, error)
+
 // DaemonsetMounter is a [Mounter] that delegates Mountpoint process management
 // to a secondary daemonset running on the same node. It communicates via the
 // secondary pod's emptyDir volume, accessed through the kubelet pod directory.
@@ -95,183 +100,244 @@ type DaemonsetMounter struct {
 	rediscoverCh chan struct{}
 
 	// Injectable for testing. nil = use default.
-	mountSyscall mountSyscallFunc
+	mountSyscall      mountSyscallFunc
+	bindMountSyscall  bindMountSyscallFunc
+	mountInfoProvider mountInfoProviderFunc
+
+	// mountMap tracks shared source mounts for pod-sharing.
+	// Mount/Unmount use reference-counted sharing via this map.
+	mountMap *MountMap
 }
 
 // NewDaemonsetMounter creates a new [DaemonsetMounter].
-// mountSyscall may be nil, in which case the default FUSE mount implementation is used.
+// mountSyscall, bindMountSyscall, and mountInfoProvider may be nil,
+// in which case the default implementations are used.
 func NewDaemonsetMounter(clientset kubernetes.Interface, nodeID string, mount *mpmounter.Mounter,
-	credProvider credentialprovider.ProviderInterface, mountSyscall mountSyscallFunc) *DaemonsetMounter {
+	credProvider credentialprovider.ProviderInterface, mountSyscall mountSyscallFunc, bindMountSyscall bindMountSyscallFunc, mountInfoProvider mountInfoProviderFunc) *DaemonsetMounter {
 	return &DaemonsetMounter{
-		clientset:    clientset,
-		nodeID:       nodeID,
-		kubeletPath:  util.ContainerKubeletPath(),
-		mount:        mount,
-		credProvider: credProvider,
-		rediscoverCh: make(chan struct{}, 1),
-		mountSyscall: mountSyscall,
+		clientset:         clientset,
+		nodeID:            nodeID,
+		kubeletPath:       util.ContainerKubeletPath(),
+		mount:             mount,
+		credProvider:      credProvider,
+		rediscoverCh:      make(chan struct{}, 1),
+		mountSyscall:      mountSyscall,
+		bindMountSyscall:  bindMountSyscall,
+		mountInfoProvider: mountInfoProvider,
+		mountMap:          NewMountMap(),
 	}
 }
 
-// Mount mounts the given S3 bucket at the target path.
+// Mount mounts the given S3 bucket at the target path with pod-sharing support.
 //
-// It performs the following steps:
-//  1. Provides credentials for the mount
-//  2. Opens /dev/fuse and performs the kernel FUSE mount on target
-//  3. Sends mount options (including FUSE FD) to the secondary daemonset via UDS
-//  4. Waits for Mountpoint to start serving (or an error)
+// Flow:
+//  1. If target is already mounted (republish): refresh credentials without locking, return early
+//  2. Acquire per-volume lock via MountMap (serializes concurrent NodePublishVolume for same PV)
+//  3. Provision credentials (under lock to avoid race with cleanup on failure)
+//  4. If an existing healthy source mount exists for this volumeID → bind mount to target
+//  5. If no source exists (or dead) → FUSE mount at source path, send FD to mounter, wait for readiness
+//  6. Bind mount source → target
+//  7. Track the target in MountMap for refcounting
+//
+// On initial mount failure (fuseMount or bindMount), credentials are cleaned up immediately
+// under the lock. On unmount of last consumer, the FUSE source is unmounted (causing mount-s3
+// to exit via kernel FUSE teardown) and credentials are removed.
 func (dm *DaemonsetMounter) Mount(ctx context.Context, bucketName string, target string,
 	credentialCtx credentialprovider.ProvideContext, args mountpoint.Args, fsGroup string, userEnv envprovider.Environment) error {
-	mountId, err := GetMountId(target)
-	if err != nil {
-		return err
-	}
-	volumeId := credentialCtx.VolumeID
-	mountSuccess := false
 
-	commDir, err := dm.GetCommDir()
+	// Extract PV name from target path to use as the volume identifier for sharing and filesystem paths.
+	// PV names are Kubernetes resource names — guaranteed DNS-safe (no '/', no '..', alphanumeric + '-' + '.').
+	// Target path format: /var/lib/kubelet/pods/<podUID>/volumes/kubernetes.io~csi/<pv-name>/mount
+	parsedTarget, err := targetpath.Parse(target)
 	if err != nil {
-		return fmt.Errorf("failed to find s3-csi-daemonset-mounter pod: %w. %s", err, helpMessageForCheckingMounterPodStatus())
+		return fmt.Errorf("failed to parse target path %q: %w", target, err)
 	}
+	volumeID := parsedTarget.VolumeID // This is the PV name
 
-	alreadyMounted, err := dm.IsMountPoint(target)
+	// Idempotency: if target is already a healthy Mountpoint mount, refresh creds and return.
+	// Kubelet may call NodePublishVolume repeatedly (requiresRepublish, retries).
+	isMounted, err := dm.IsMountPoint(target)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("failed to check if target %q is a mount point (mount target is possibly"+
 			" corrupted, manual pod re-creation %s might be required for mount recovery): %w",
 			target, credentialCtx.WorkloadPodID, err)
 	}
-
-	// Cleanup provisioned credentials only if this is a new mount (not a republish) and mount failed
-	defer func() {
-		if alreadyMounted || mountSuccess {
-			return
+	if isMounted {
+		// Republish: refresh credentials for the existing mount (token rotation).
+		commDir, err := dm.GetCommDir()
+		if err == nil {
+			if _, err := dm.provideCredentials(ctx, commDir, volumeID, &credentialCtx); err != nil {
+				klog.Errorf("DaemonsetMounter: failed to refresh credentials on republish for %s: %v", target, err)
+			}
 		}
-		if err := dm.cleanupCredentials(commDir, mountId, credentialCtx.ToCleanupCtx()); err != nil {
-			klog.Errorf("DaemonsetMounter: failed to clean up credential directory for mount %s: %v", mountId, err)
-		}
-	}()
-
-	// Provision credentials before the alreadyMounted early return so republish refreshes them
-	credsEnv, err := dm.provideCredentials(ctx, commDir, mountId, &credentialCtx)
-	if err != nil {
-		return err
-	}
-
-	// Idempotency: if target is already a healthy Mountpoint mount, return early
-	if alreadyMounted {
 		klog.V(4).Infof("DaemonsetMounter: target %s is already mounted, credentials refreshed", target)
-		mountSuccess = true
 		return nil
 	}
 
-	// Ensure target directory exists (kubelet may not have created it yet)
-	if err := os.MkdirAll(target, targetDirPerm); err != nil {
-		return fmt.Errorf("failed to create target directory %q: %w", target, err)
-	}
-
-	defer func() {
-		if mountSuccess {
-			return
-		}
-		// TODO(vlaad): might leak a mount, implement periodic stale mount cleanup
-		if umErr := dm.mount.Unmount(target); umErr != nil {
-			klog.Errorf("Failed to unmount %q during cleanup: %v", target, umErr)
-		}
-	}()
-
-	// Perform FUSE mount and send options to secondary daemonset
-	if err := dm.mountS3AtTarget(ctx, target, bucketName, args, mountId, volumeId, commDir, userEnv, credsEnv); err != nil {
-		return err
-	}
-
-	mountSuccess = true
-	klog.V(4).Infof("DaemonsetMounter: volume %s (mount %s) mounted at %s", volumeId, mountId, target)
-	return nil
+	// Pod-sharing: use MountMap to share a single Mountpoint process per volume.
+	// Credential provisioning happens inside mountOrShareSource under the per-volume lock
+	// to avoid races between concurrent NodePublishVolume calls for the same PV.
+	return dm.mountOrShareSource(ctx, bucketName, target, volumeID, credentialCtx, args, fsGroup, userEnv)
 }
 
-// Unmount unmounts the FUSE filesystem at target.
-// This causes the Mountpoint process in the secondary daemonset to exit.
-func (dm *DaemonsetMounter) Unmount(ctx context.Context, target string, cleanupCtx credentialprovider.CleanupContext) error {
-	// cleanup the error file and credentials
+// mountOrShareSource implements the pod-sharing Mount flow using MountMap.
+func (dm *DaemonsetMounter) mountOrShareSource(ctx context.Context, bucketName string, target string,
+	volumeID string, credentialCtx credentialprovider.ProvideContext, args mountpoint.Args, fsGroup string, userEnv envprovider.Environment) error {
+
+	// Get or create the per-volume entry, then lock it.
+	// Retry loop ensures we hold the canonical entry — not one orphaned by a concurrent unmount/delete.
+	var entry *MountEntry
+	for {
+		entry, _ = dm.mountMap.GetOrCreate(volumeID)
+		entry.mu.Lock()
+		if dm.mountMap.Get(volumeID) == entry {
+			break // we hold the canonical entry
+		}
+		entry.mu.Unlock() // orphaned entry (deleted by concurrent unmount), retry
+	}
+	defer entry.mu.Unlock()
+
+	// Provision credentials under the lock to avoid races between concurrent
+	// NodePublishVolume calls for the same PV (all share one credential file).
 	commDir, err := dm.GetCommDir()
 	if err != nil {
-		return fmt.Errorf("failed to find s3-csi-daemonset-mounter pod: %w. %s", err, helpMessageForCheckingMounterPodStatus())
+		return fmt.Errorf("connection to s3-csi-daemonset-mounter not yet established, allowing kubelet to retry NodePublishVolume: %w. %s", err, helpMessageForCheckingMounterPodStatus())
 	}
-	mountId, err := GetMountId(target)
+	credsEnv, err := dm.provideCredentials(ctx, commDir, volumeID, &credentialCtx)
 	if err != nil {
 		return err
 	}
 
-	if err = removeIfExists(filepath.Join(commDir, GetErrorFileName(mountId))); err != nil {
-		return fmt.Errorf("failed to remove the error file: %w", err)
+	// Build mount params for this request — used for validation and stored on first mount.
+	incomingParams := MountParams{
+		MountOptions:             args.SortedList(),
+		AuthenticationSource:     credentialCtx.AuthenticationSource,
+		ServiceAccountName:       credentialCtx.ServiceAccountName,
+		ServiceAccountEKSRoleARN: credentialCtx.ServiceAccountEKSRoleARN,
+		PodNamespace:             credentialCtx.PodNamespace,
+		FSGroup:                  fsGroup,
 	}
 
-	err = dm.cleanupCredentials(commDir, mountId, cleanupCtx)
-	if err != nil {
-		return fmt.Errorf("failed to cleanup credentials: %w", err)
+	sourcePath := SourceMountPath(dm.kubeletPath, volumeID)
+
+	if entry.initialized {
+		// Existing source — validate compatibility before sharing.
+		if err := entry.Params.ValidateCompatibility(&incomingParams); err != nil {
+			return fmt.Errorf("cannot share mount for volume %s: %w", volumeID, err)
+		}
+
+		// Check health before sharing.
+		if dm.IsSourceHealthy(entry.SourcePath) {
+			// Healthy source: bind mount to new target.
+			if err := dm.BindMount(entry.SourcePath, target); err != nil {
+				return err
+			}
+			entry.RefCount++
+			entry.Targets = append(entry.Targets, target)
+			klog.V(4).Infof("DaemonsetMounter: shared existing mount for volume %s → %s (refcount=%d)",
+				volumeID, target, entry.RefCount)
+			return nil
+		}
+		// Dead source: clean up and fall through to new mount.
+		klog.V(2).Infof("DaemonsetMounter: source %s is dead for volume %s, recovering", entry.SourcePath, volumeID)
+		if err := dm.mount.Unmount(entry.SourcePath); err != nil {
+			if !os.IsNotExist(err) {
+				return fmt.Errorf("failed to unmount dead source %q for volume %s, will retry: %w", entry.SourcePath, volumeID, err)
+			}
+		}
+		os.Remove(entry.SourcePath)
+		entry.initialized = false
 	}
 
-	// finally unmount (this order ensures retrying cleanup)
-	err = dm.mount.Unmount(target)
-	if err != nil {
-		return fmt.Errorf("failed to unmount %q: %w", target, err)
+	// New mount: FUSE mount at source, then bind to target.
+	mountId := volumeID // In sharing mode, one mount per volume
+	if err := dm.fuseMount(ctx, bucketName, sourcePath, mountId, args, userEnv, credsEnv); err != nil {
+		dm.cleanupCredentials(commDir, volumeID, credentialCtx.ToCleanupCtx())
+		return err
 	}
 
-	klog.V(4).Infof("DaemonsetMounter: volume %s unmounted from %s", cleanupCtx.VolumeID, target)
+	// Bind mount source → target.
+	if err := dm.BindMount(sourcePath, target); err != nil {
+		// Cleanup source and credentials on bind failure.
+		dm.mount.Unmount(sourcePath)
+		os.Remove(sourcePath)
+		dm.cleanupCredentials(commDir, volumeID, credentialCtx.ToCleanupCtx())
+		return err
+	}
+
+	// Populate the entry.
+	entry.SourcePath = sourcePath
+	entry.MountID = mountId
+	entry.Params = incomingParams
+	entry.RefCount = 1
+	entry.Targets = []string{target}
+	entry.initialized = true
+
+	// Persist meta to disk for recovery after driver restart.
+	if err := WriteMeta(dm.kubeletPath, entry); err != nil {
+		klog.Errorf("DaemonsetMounter: failed to write meta for volume %s: %v (non-fatal)", volumeID, err)
+	}
+
+	klog.V(4).Infof("DaemonsetMounter: new shared mount for volume %s at source %s → %s", volumeID, sourcePath, target)
 	return nil
 }
 
-// IsMountPoint returns whether the given target is a Mountpoint mount.
-func (dm *DaemonsetMounter) IsMountPoint(target string) (bool, error) {
-	return dm.mount.CheckMountpoint(target)
-}
+// fuseMount performs the FUSE mount + FD send + wait cycle at the given path.
+// Credentials are already provisioned by the caller (Mount).
+func (dm *DaemonsetMounter) fuseMount(ctx context.Context, bucketName string, mountPath string,
+	mountId string, args mountpoint.Args, userEnv envprovider.Environment, credsEnv envprovider.Environment) error {
 
-// mountS3AtTarget performs the kernel FUSE mount at target and sends mount options
-// (including the FUSE fd) to the secondary daemonset. On success the mount remains
-// at target; on failure any partial mount is cleaned up.
-func (dm *DaemonsetMounter) mountS3AtTarget(ctx context.Context, target string, bucketName string,
-	args mountpoint.Args, mountId string, volumeId string, commDir string,
-	userEnv envprovider.Environment, credsEnv envprovider.Environment) error {
-	// Remove old error file if exists
-	errFilePath := filepath.Join(commDir, GetErrorFileName(mountId))
-	if err := removeIfExists(errFilePath); err != nil {
-		return fmt.Errorf("failed to remove stale error file %q: %w", errFilePath, err)
+	commDir, err := dm.GetCommDir()
+	if err != nil {
+		return fmt.Errorf("connection to s3-csi-daemonset-mounter not yet established, allowing kubelet to retry NodePublishVolume: %w. %s", err, helpMessageForCheckingMounterPodStatus())
+	}
+
+	if err := os.MkdirAll(mountPath, targetDirPerm); err != nil {
+		return fmt.Errorf("failed to create mount directory %q: %w", mountPath, err)
 	}
 
 	mountOpts := mpmounter.MountOptions{
 		ReadOnly:   args.Has(mountpoint.ArgReadOnly),
 		AllowOther: args.Has(mountpoint.ArgAllowOther) || args.Has(mountpoint.ArgAllowRoot),
 	}
-	fd, err := dm.mountSyscallWithDefault(target, mountOpts)
+	fd, err := dm.mountSyscallWithDefault(mountPath, mountOpts)
 	if err != nil {
-		return fmt.Errorf("failed to mount FUSE at %q: %w", target, err)
+		return fmt.Errorf("failed to mount FUSE at %q: %w", mountPath, err)
 	}
+
+	fdClosed := false
+	unmount := true
 	defer func() {
-		if err := mpmounter.CloseFD(fd); err != nil {
-			klog.Errorf("DaemonsetMounter: failed to close /dev/fuse fd %d: %v", fd, err)
+		if !fdClosed {
+			dm.closeFUSEDevFD(fd)
+		}
+		if unmount {
+			if umErr := dm.mount.Unmount(mountPath); umErr != nil {
+				klog.Errorf("Failed to unmount %q during cleanup: %v", mountPath, umErr)
+			}
 		}
 	}()
 
-	// TODO: add --user-agent-prefix for S3 request telemetry
+	args.Remove(mountpoint.ArgReadOnly)
 
-	// Build environment
 	env := envprovider.Environment{}
 	env.Merge(userEnv)
 	env.Merge(envprovider.Default())
 	env.Merge(credsEnv)
 
-	// Move --aws-max-attempts to env if provided
 	if maxAttempts, ok := args.Remove(mountpoint.ArgAWSMaxAttempts); ok {
 		env.Set(envprovider.EnvMaxAttempts, maxAttempts)
 	}
-	// Remove read-only from args since we already passed MS_RDONLY in mount syscall
-	args.Remove(mountpoint.ArgReadOnly)
 
-	// Send mount options to secondary daemonset
 	sockPath := filepath.Join(commDir, MountSockName)
-	klog.V(4).Infof("DaemonsetMounter: sending mount options for volume %s (mount %s) to %s", volumeId, mountId, sockPath)
+	errFilePath := filepath.Join(commDir, GetErrorFileName(mountId))
+	os.Remove(errFilePath)
+
+	klog.V(4).Infof("DaemonsetMounter: sending mount options (mount %s) to %s", mountId, sockPath)
+
 	sendCtx, sendCancel := context.WithTimeout(ctx, sendOptionsTimeout)
 	defer sendCancel()
+
 	err = mountoptions.Send(sendCtx, sockPath, mountoptions.Options{
 		Fd:         fd,
 		BucketName: bucketName,
@@ -280,8 +346,6 @@ func (dm *DaemonsetMounter) mountS3AtTarget(ctx context.Context, target string, 
 		VolumeId:   mountId,
 	})
 	if err != nil {
-		// If send failed due to stale path, signal re-discovery and let Kubelet retry NodePublishVolume.
-		// Send -> dialWithRetry retries ENOENT/ECONNREFUSED, so we only check these errors
 		if errors.Is(err, fs.ErrNotExist) || os.IsPermission(err) || errors.Is(err, context.DeadlineExceeded) {
 			klog.V(4).Infof("DaemonsetMounter: comm dir may be stale, signaling re-discovery")
 			dm.commDir.Store(nil)
@@ -290,52 +354,147 @@ func (dm *DaemonsetMounter) mountS3AtTarget(ctx context.Context, target string, 
 			default:
 			}
 		}
-		return fmt.Errorf("failed to send mount options for volume %s (mount %s): %w. %s", volumeId, mountId, err, helpMessageForGettingMounterLogs())
+		return fmt.Errorf("failed to send mount options (mount %s): %w. %s", mountId, err, helpMessageForGettingMounterLogs())
 	}
 
-	// Wait for mount readiness or error
-	err = dm.waitForMount(ctx, target, mountId, errFilePath)
+	dm.closeFUSEDevFD(fd)
+	fdClosed = true
+
+	err = dm.waitForMount(ctx, mountPath, mountId, errFilePath)
 	if err != nil {
 		return err
 	}
 
+	unmount = false
 	return nil
 }
 
-// waitForMount waits until Mountpoint is serving at target or an error occurs.
-func (dm *DaemonsetMounter) waitForMount(parentCtx context.Context, target, mountId, errFilePath string) error {
-	ctx, cancel := context.WithTimeout(parentCtx, mountReadyTimeout)
-	defer cancel()
+// Unmount unmounts the target path with pod-sharing awareness.
+//
+// Flow:
+//   - Unmounts the bind mount at target
+//   - Decrements refcount in MountMap
+//   - If refcount reaches 0, unmounts the FUSE source and removes the entry
+func (dm *DaemonsetMounter) Unmount(ctx context.Context, target string, credentialCtx credentialprovider.CleanupContext) error {
+	parsedTarget, err := targetpath.Parse(target)
+	if err != nil {
+		return fmt.Errorf("failed to parse target path %q: %w", target, err)
+	}
+	volumeID := parsedTarget.VolumeID // This is the PV name
+	return dm.releaseTarget(target, volumeID)
+}
 
-	mountResultCh := make(chan error, 2)
+// releaseTarget handles the Unmount flow with MountMap refcounting.
+func (dm *DaemonsetMounter) releaseTarget(target string, volumeID string) error {
+	entry := dm.mountMap.Get(volumeID)
+	if entry == nil {
+		// No entry means we never mounted this volume. Return success (idempotency).
+		klog.V(4).Infof("DaemonsetMounter: no mount map entry for volume %s, unmount of %s is a no-op", volumeID, target)
+		return nil
+	}
 
-	// Poll for error file
-	go func() {
-		wait.PollUntilContextCancel(ctx, mountReadyPollInterval, true, func(ctx context.Context) (bool, error) {
-			content, err := os.ReadFile(errFilePath)
-			if err != nil {
-				return false, nil
-			}
-			os.Remove(errFilePath)
-			mountResultCh <- fmt.Errorf("Mountpoint for mount %s failed: %s", mountId, string(content))
-			return true, nil
-		})
-	}()
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
 
-	// Poll for mount readiness
-	go func() {
-		err := wait.PollUntilContextCancel(ctx, mountReadyPollInterval, true, func(ctx context.Context) (bool, error) {
-			isMounted, _ := dm.mount.CheckMountpoint(target)
-			return isMounted, nil
-		})
-		if err != nil {
-			mountResultCh <- fmt.Errorf("timed out waiting for Mountpoint to serve mount %s at %s. %s", mountId, target, helpMessageForGettingMounterLogs())
-		} else {
-			mountResultCh <- nil
+	// Unmount the bind mount at target.
+	if err := dm.mount.Unmount(target); err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("failed to unmount bind mount at %q: %w", target, err)
 		}
-	}()
+	}
 
-	return <-mountResultCh
+	// Remove target from entry.
+	for i, t := range entry.Targets {
+		if t == target {
+			entry.Targets = append(entry.Targets[:i], entry.Targets[i+1:]...)
+			entry.RefCount--
+			break
+		}
+	}
+
+	if entry.RefCount == 0 {
+		// Last consumer: clean up credentials first, then unmount the FUSE source.
+		klog.V(4).Infof("DaemonsetMounter: last consumer for volume %s, unmounting source %s", volumeID, entry.SourcePath)
+
+		// Clean up error file and credentials before unmount (ensures retrying cleanup on failure).
+		if dir := dm.commDir.Load(); dir != nil {
+			os.Remove(filepath.Join(*dir, GetErrorFileName(entry.MountID)))
+			if err := dm.cleanupCredentials(*dir, entry.MountID, credentialprovider.CleanupContext{
+				VolumeID:  volumeID,
+				MountKind: credentialprovider.MountKindDaemonset,
+			}); err != nil {
+				klog.Errorf("DaemonsetMounter: failed to cleanup credentials for volume %s: %v", volumeID, err)
+			}
+		}
+
+		// Unmount FUSE source — causes mount-s3 to exit via kernel FUSE teardown.
+		if err := dm.mount.Unmount(entry.SourcePath); err != nil {
+			klog.Errorf("DaemonsetMounter: failed to unmount source %q: %v (best-effort cleanup)", entry.SourcePath, err)
+		}
+		os.Remove(entry.SourcePath)
+
+		// Delete entry from the map — the retry loop in Mount handles the race.
+		dm.mountMap.Delete(volumeID)
+
+		// Remove persisted meta file.
+		RemoveMeta(dm.kubeletPath, volumeID)
+	}
+
+	klog.V(4).Infof("DaemonsetMounter: volume %s unmounted from %s", volumeID, target)
+	return nil
+}
+
+// GetErrorFileName returns the error file name for a given mount ID.
+func GetErrorFileName(mountId string) string {
+	return mountId + MountErrorSuffix
+}
+
+// helpMessageForGettingMounterLogs returns a help message with a command to get mounter logs.
+func helpMessageForGettingMounterLogs() string {
+	return fmt.Sprintf("You can see mounter logs by running: `kubectl logs -n %s -l app=s3-csi-daemonset-mounter`", mounterNamespace)
+}
+
+// helpMessageForCheckingMounterPodStatus returns a help message with a command to check mounter pod status.
+func helpMessageForCheckingMounterPodStatus() string {
+	return fmt.Sprintf("You can check mounter pod status by running: `kubectl get pods -n %s -l app=s3-csi-daemonset-mounter`", mounterNamespace)
+}
+
+// IsMountPoint returns whether the given target is a Mountpoint mount.
+func (dm *DaemonsetMounter) IsMountPoint(target string) (bool, error) {
+	return dm.mount.CheckMountpoint(target)
+}
+
+// IsSourceHealthy checks if the FUSE mount at sourcePath is alive and serving.
+
+func (dm *DaemonsetMounter) IsSourceHealthy(sourcePath string) bool {
+	return dm.mount.IsHealthyMountpoint(sourcePath)
+}
+
+// BindMount performs a bind mount from source to target, creating the target directory if needed.
+func (dm *DaemonsetMounter) BindMount(source, target string) error {
+	if err := os.MkdirAll(target, targetDirPerm); err != nil {
+		return fmt.Errorf("failed to create bind mount target directory %q: %w", target, err)
+	}
+	if err := dm.bindMountSyscallWithDefault(source, target); err != nil {
+		return fmt.Errorf("failed to bind mount %q → %q: %w", source, target, err)
+	}
+	klog.V(4).Infof("DaemonsetMounter: bind mounted %s → %s", source, target)
+	return nil
+}
+
+// bindMountSyscallWithDefault delegates to bindMountSyscall if set, or falls back to dm.mount.BindMount.
+func (dm *DaemonsetMounter) bindMountSyscallWithDefault(source, target string) error {
+	if dm.bindMountSyscall != nil {
+		return dm.bindMountSyscall(source, target)
+	}
+	return dm.mount.BindMount(source, target)
+}
+
+// TODO: refactor closeFUSEDevFD into a shared helper (duplicated in pod_mounter.go)
+func (dm *DaemonsetMounter) closeFUSEDevFD(fd int) {
+	if err := mpmounter.CloseFD(fd); err != nil {
+		klog.V(4).Infof("DaemonsetMounter: failed to close /dev/fuse fd %d: %v", fd, err)
+	}
 }
 
 // mountSyscallWithDefault delegates to mountSyscall if set, or falls back to dm.mount.Mount.
@@ -375,43 +534,6 @@ func (dm *DaemonsetMounter) cleanupCredentials(commDir, mountId string, cleanupC
 		return err
 	}
 	return nil
-}
-
-// GetMountId returns a filesystem-safe mount ID derived from the target path.
-// It uses the pod UID and PV name from the kubelet target path structure:
-//
-//	.../pods/<pod-uid>/volumes/kubernetes.io~csi/<pv-name>/mount
-//
-// Both components are escaped as defense in depth against unexpected characters.
-func GetMountId(target string) (string, error) {
-	tp, err := targetpath.Parse(target)
-	if err != nil {
-		return "", fmt.Errorf("failed to parse target path %q: %w", target, err)
-	}
-	return k8sstrings.EscapeQualifiedName(tp.PodID) + "-" + k8sstrings.EscapeQualifiedName(tp.VolumeID), nil
-}
-
-// GetErrorFileName returns the error file name for a given mount ID.
-func GetErrorFileName(mountId string) string {
-	return mountId + MountErrorSuffix
-}
-
-// removeIfExists removes a file, ignoring "not exist" errors.
-func removeIfExists(path string) error {
-	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return err
-	}
-	return nil
-}
-
-// helpMessageForGettingMounterLogs returns a help message with a command to get mounter logs.
-func helpMessageForGettingMounterLogs() string {
-	return fmt.Sprintf("You can see mounter logs by running: `kubectl logs -n %s -l app=s3-csi-daemonset-mounter`", mounterNamespace)
-}
-
-// helpMessageForCheckingMounterPodStatus returns a help message with a command to check mounter pod status.
-func helpMessageForCheckingMounterPodStatus() string {
-	return fmt.Sprintf("You can check mounter pod status by running: `kubectl get pods -n %s -l app=s3-csi-daemonset-mounter`", mounterNamespace)
 }
 
 // DiscoverCommDir discovers the comm dir path synchronously with retries.
@@ -502,6 +624,100 @@ func (dm *DaemonsetMounter) GetCommDir() (string, error) {
 	return *dir, nil
 }
 
+// KubeletPath returns the kubelet path used by this mounter.
+func (dm *DaemonsetMounter) KubeletPath() string {
+	return dm.kubeletPath
+}
+
+// mountInfoProviderWithDefault delegates to mountInfoProvider if set, or falls back to parseMountInfoFromProc.
+func (dm *DaemonsetMounter) mountInfoProviderWithDefault() ([]mountInfoEntry, error) {
+	if dm.mountInfoProvider != nil {
+		return dm.mountInfoProvider()
+	}
+	return parseMountInfoFromProc()
+}
+
+// RebuildMountMap reconstructs the MountMap from disk on driver startup.
+// It scans the meta directory for .meta.json files, verifies each source mount
+// is still alive via /proc/self/mountinfo, and counts bind mounts (targets) by
+// matching device IDs.
+//
+// Algorithm:
+//  1. List all .meta.json files in the plugins/s3.csi.aws.com/mnt/ directory
+//  2. For each meta file, parse the JSON to get MountMeta
+//  3. Scan /proc/self/mountinfo to find the source mount and its device ID
+//  4. Count bind mounts sharing that device ID (these are the targets)
+//  5. Populate MountMap entries with refcount = number of bind mounts
+//
+// Entries with dead source mounts are skipped (meta file cleaned up).
+func (dm *DaemonsetMounter) RebuildMountMap() error {
+	metaDir := filepath.Join(dm.kubeletPath, "plugins", "s3.csi.aws.com", "mnt")
+	entries, err := os.ReadDir(metaDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			klog.V(4).Info("MountMap: no meta directory found, starting fresh")
+			return nil
+		}
+		return fmt.Errorf("failed to read meta directory %s: %w", metaDir, err)
+	}
+
+	// Parse mount table once
+	mountInfos, err := dm.mountInfoProviderWithDefault()
+	if err != nil {
+		return fmt.Errorf("failed to parse /proc/self/mountinfo: %w", err)
+	}
+
+	for _, dirEntry := range entries {
+		if !strings.HasSuffix(dirEntry.Name(), ".meta.json") {
+			continue
+		}
+
+		metaPath := filepath.Join(metaDir, dirEntry.Name())
+		meta, err := readMeta(metaPath)
+		if err != nil {
+			klog.Warningf("MountMap: failed to read meta file %s, skipping: %v", metaPath, err)
+			continue
+		}
+
+		// Derive SourcePath and MountID from VolumeID (they are not persisted)
+		sourcePath := SourceMountPath(dm.kubeletPath, meta.VolumeID)
+		mountID := meta.VolumeID // MountID == VolumeID in sharing mode
+
+		// Find the source mount in mountinfo
+		sourceMI := findMountByPath(mountInfos, sourcePath)
+		if sourceMI == nil {
+			// Source mount is gone — clean up the meta file
+			klog.V(2).Infof("MountMap: source mount %s for volume %s not found in mount table, cleaning up", sourcePath, meta.VolumeID)
+			os.Remove(metaPath)
+			continue
+		}
+
+		// Count bind mounts sharing the same device ID (major:minor)
+		targets := findBindMountTargets(mountInfos, sourceMI.DeviceID, sourcePath)
+
+		entry, _ := dm.mountMap.GetOrCreate(meta.VolumeID)
+		entry.mu.Lock()
+		entry.SourcePath = sourcePath
+		entry.MountID = mountID
+		entry.Params = MountParams{
+			MountOptions:             meta.MountOptions,
+			AuthenticationSource:     meta.AuthenticationSource,
+			ServiceAccountName:       meta.ServiceAccountName,
+			ServiceAccountEKSRoleARN: meta.ServiceAccountEKSRoleARN,
+			PodNamespace:             meta.PodNamespace,
+			FSGroup:                  meta.FSGroup,
+		}
+		entry.RefCount = len(targets)
+		entry.Targets = targets
+		entry.initialized = true
+		entry.mu.Unlock()
+
+		klog.V(2).Infof("MountMap: recovered volume %s with %d targets from mount table", meta.VolumeID, len(targets))
+	}
+
+	return nil
+}
+
 // tryDiscoverCommDir performs a single attempt to find the secondary mounter pod on
 // this node and returns the path to its emptyDir comm volume as seen from the
 // primary daemonset (via kubelet pod dir).
@@ -532,4 +748,40 @@ func (dm *DaemonsetMounter) tryDiscoverCommDir(ctx context.Context) (string, err
 	commDir := filepath.Join(dm.kubeletPath, "pods", podUID, "volumes", "kubernetes.io~empty-dir", CommVolumeName)
 	klog.V(4).Infof("DaemonsetMounter: discovered mounter pod %s (uid=%s), comm dir: %s", running[0].Name, podUID, commDir)
 	return commDir, nil
+}
+
+// waitForMount waits until Mountpoint is serving at target or an error occurs.
+func (dm *DaemonsetMounter) waitForMount(parentCtx context.Context, target, mountId, errFilePath string) error {
+	ctx, cancel := context.WithTimeout(parentCtx, mountReadyTimeout)
+	defer cancel()
+
+	mountResultCh := make(chan error, 2)
+
+	// Poll for error file
+	go func() {
+		wait.PollUntilContextCancel(ctx, mountReadyPollInterval, true, func(ctx context.Context) (bool, error) {
+			content, err := os.ReadFile(errFilePath)
+			if err != nil {
+				return false, nil
+			}
+			os.Remove(errFilePath)
+			mountResultCh <- fmt.Errorf("Mountpoint for mount %s failed: %s", mountId, string(content))
+			return true, nil
+		})
+	}()
+
+	// Poll for mount readiness
+	go func() {
+		err := wait.PollUntilContextCancel(ctx, mountReadyPollInterval, true, func(ctx context.Context) (bool, error) {
+			isMounted, _ := dm.mount.CheckMountpoint(target)
+			return isMounted, nil
+		})
+		if err != nil {
+			mountResultCh <- fmt.Errorf("timed out waiting for Mountpoint to serve mount %s at %s. %s", mountId, target, helpMessageForGettingMounterLogs())
+		} else {
+			mountResultCh <- nil
+		}
+	}()
+
+	return <-mountResultCh
 }

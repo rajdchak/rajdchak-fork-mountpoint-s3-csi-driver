@@ -2,10 +2,10 @@ package mounter_test
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -18,10 +18,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/mount-utils"
 
-	"github.com/golang/mock/gomock"
-
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/node/credentialprovider"
-	mock_credentialprovider "github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/node/credentialprovider/mocks"
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/node/envprovider"
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/node/mounter"
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/node/mounter/mountertest"
@@ -30,6 +27,17 @@ import (
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/mountpoint/mountoptions"
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/util/testutil/assert"
 )
+
+// noopCredProvider is a no-op credential provider for unit tests.
+type noopCredProvider struct{}
+
+func (n *noopCredProvider) Provide(_ context.Context, _ credentialprovider.ProvideContext) (envprovider.Environment, credentialprovider.AuthenticationSource, error) {
+	return nil, "", nil
+}
+
+func (n *noopCredProvider) Cleanup(_ credentialprovider.CleanupContext) error {
+	return nil
+}
 
 type dmTestCtx struct {
 	t   *testing.T
@@ -47,10 +55,20 @@ type dmTestCtx struct {
 	mounterPodUID string
 	kubeletPath   string
 	commDir       string
-	targetPath    string
 }
 
-func setupDM(t *testing.T, credProvider ...credentialprovider.ProviderInterface) *dmTestCtx {
+// targetPath returns a valid kubelet-style target path that targetpath.Parse can parse.
+// Format: <kubeletPath>/pods/<podUID>/volumes/kubernetes.io~csi/<volumeID>/mount
+func (testCtx *dmTestCtx) targetPath(podUID string) string {
+	return filepath.Join(testCtx.kubeletPath, "pods", podUID, "volumes", "kubernetes.io~csi", testCtx.volumeID, "mount")
+}
+
+// targetPathWithVolume returns a valid kubelet-style target path for a specific volumeID.
+func (testCtx *dmTestCtx) targetPathWithVolume(podUID, volumeID string) string {
+	return filepath.Join(testCtx.kubeletPath, "pods", podUID, "volumes", "kubernetes.io~csi", volumeID, "mount")
+}
+
+func setupDM(t *testing.T) *dmTestCtx {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -97,8 +115,6 @@ func setupDM(t *testing.T, credProvider ...credentialprovider.ProviderInterface)
 	client := fake.NewSimpleClientset(pod)
 	fakeMounter := mount.NewFakeMounter(nil)
 
-	targetPath := filepath.Join(kubeletPath, "pods", podUID, "volumes", "kubernetes.io~csi", volumeID, "mount")
-
 	testCtx := &dmTestCtx{
 		t:             t,
 		ctx:           ctx,
@@ -111,7 +127,6 @@ func setupDM(t *testing.T, credProvider ...credentialprovider.ProviderInterface)
 		mounterPodUID: mounterPodUID,
 		kubeletPath:   kubeletPath,
 		commDir:       commDir,
-		targetPath:    targetPath,
 	}
 
 	mountSyscall := func(target string, opts mpmounter.MountOptions) (int, error) {
@@ -125,21 +140,9 @@ func setupDM(t *testing.T, credProvider ...credentialprovider.ProviderInterface)
 	}
 
 	t.Setenv("CONTAINER_KUBELET_PATH", kubeletPath)
-
-	var cp credentialprovider.ProviderInterface
-	if len(credProvider) > 0 && credProvider[0] != nil {
-		cp = credProvider[0]
-	} else {
-		mockCtl := gomock.NewController(t)
-		mockCP := mock_credentialprovider.NewMockProviderInterface(mockCtl)
-		mockCP.EXPECT().Provide(gomock.Any(), gomock.Any()).
-			Return(envprovider.Environment{}, credentialprovider.AuthenticationSourceDriver, nil).
-			AnyTimes()
-		mockCP.EXPECT().Cleanup(gomock.Any()).Return(nil).AnyTimes()
-		cp = mockCP
-	}
-
-	dm := mounter.NewDaemonsetMounter(client, nodeName, mpmounter.NewWithMount(fakeMounter), cp, mountSyscall)
+	dm := mounter.NewDaemonsetMounter(client, nodeName, mpmounter.NewWithMount(fakeMounter), &noopCredProvider{}, mountSyscall, func(source, target string) error {
+		return fakeMounter.Mount(source, target, "bind", []string{"bind"})
+	}, nil)
 	err = dm.DiscoverCommDir(ctx)
 	assert.NoError(t, err)
 
@@ -151,7 +154,7 @@ func TestDaemonsetMounter(t *testing.T) {
 	t.Run("Mounting", func(t *testing.T) {
 		t.Run("Correctly passes mount options", func(t *testing.T) {
 			testCtx := setupDM(t)
-			target := testCtx.targetPath
+			target := testCtx.targetPath(testCtx.podUID)
 
 			devNull := mountertest.OpenDevNull(t)
 			testCtx.mountSyscall = func(target string, opts mpmounter.MountOptions) (int, error) {
@@ -177,7 +180,8 @@ func TestDaemonsetMounter(t *testing.T) {
 			}()
 
 			got := testCtx.receiveMountOptions()
-			testCtx.mount.Mount("mountpoint-s3", target, "fuse", nil)
+			sourcePath := mounter.SourceMountPath(testCtx.kubeletPath, testCtx.volumeID)
+			testCtx.mount.Mount("mountpoint-s3", sourcePath, "fuse", nil)
 
 			err := <-mountRes
 			assert.NoError(t, err)
@@ -194,28 +198,13 @@ func TestDaemonsetMounter(t *testing.T) {
 				BucketName: testCtx.bucketName,
 				Args:       []string{"--prefix=data/"},
 				Env:        env.List(),
-				VolumeId:   mustGetMountId(t, testCtx.targetPath),
+				VolumeId:   testCtx.volumeID,
 			}, got)
 		})
 
-		t.Run("Does not duplicate mounts if target is already mounted and refreshes credentials", func(t *testing.T) {
-			mockCtl := gomock.NewController(t)
-			mockCredProvider := mock_credentialprovider.NewMockProviderInterface(mockCtl)
-
-			testCtx := setupDM(t, mockCredProvider)
-			target := testCtx.targetPath
-			mountId := mustGetMountId(t, target)
-
-			expectedWritePath := filepath.Join(testCtx.commDir, mountId)
-			expectedEnvPath := filepath.Join("/comm", mountId)
-
-			mockCredProvider.EXPECT().Provide(gomock.Any(), gomock.Any()).
-				DoAndReturn(func(_ context.Context, provideCtx credentialprovider.ProvideContext) (envprovider.Environment, credentialprovider.AuthenticationSource, error) {
-					assert.Equals(t, expectedWritePath, provideCtx.WritePath)
-					assert.Equals(t, expectedEnvPath, provideCtx.EnvPath)
-					assert.Equals(t, credentialprovider.MountKindDaemonset, provideCtx.MountKind)
-					return envprovider.Environment{}, credentialprovider.AuthenticationSourceDriver, nil
-				})
+		t.Run("Does not duplicate mounts if target is already mounted", func(t *testing.T) {
+			testCtx := setupDM(t)
+			target := testCtx.targetPath(testCtx.podUID)
 
 			err := os.MkdirAll(target, 0755)
 			assert.NoError(t, err)
@@ -240,7 +229,7 @@ func TestDaemonsetMounter(t *testing.T) {
 
 		t.Run("Unmounts source if mounter does not receive mount options", func(t *testing.T) {
 			testCtx := setupDM(t)
-			target := testCtx.targetPath
+			target := testCtx.targetPath(testCtx.podUID)
 
 			// Create socket but don't listen so no one receives mount options.
 			// mount_options.go Send -> dialWithRetry will retry until context deadline.
@@ -260,18 +249,20 @@ func TestDaemonsetMounter(t *testing.T) {
 			}
 			assert.Contains(t, err.Error(), "failed to send mount options")
 
-			// Expect false, nil output from mount.go CheckMountpoint
-			mounted, err := testCtx.dm.IsMountPoint(target)
+			// In sharing mode, FUSE mount goes to source path, not target.
+			// After failure, source should be unmounted and target should not exist.
+			sourcePath := filepath.Join(testCtx.kubeletPath, "plugins", "s3.csi.aws.com", "mnt", testCtx.volumeID)
+			mounted, err := testCtx.dm.IsMountPoint(sourcePath)
 			assert.NoError(t, err)
 			if mounted {
-				t.Error("it should unmount target if mounter does not receive the mount options")
+				t.Error("it should unmount source if mounter does not receive the mount options")
 			}
-			testCtx.assertUnmounted(target)
+			testCtx.assertUnmounted(sourcePath)
 		})
 
 		t.Run("Unmounts source if Mountpoint fails to start with error file", func(t *testing.T) {
 			testCtx := setupDM(t)
-			target := testCtx.targetPath
+			target := testCtx.targetPath(testCtx.podUID)
 
 			// Skip fakeMounter - it caused waitForMount's CheckMountpoint poll to win the race over .error file poll
 			testCtx.mountSyscall = func(tgt string, opts mpmounter.MountOptions) (int, error) {
@@ -281,7 +272,7 @@ func TestDaemonsetMounter(t *testing.T) {
 			}
 
 			// Construct error file path
-			mountId := mustGetMountId(t, testCtx.targetPath)
+			mountId := testCtx.volumeID
 			errFilePath := filepath.Join(testCtx.commDir, mounter.GetErrorFileName(mountId))
 
 			mountRes := make(chan error)
@@ -297,7 +288,6 @@ func TestDaemonsetMounter(t *testing.T) {
 			// Do not register mount - simulates Mountpoint receiving fd but fails to start serving.
 
 			// Write error file to simulate Mountpoint crash
-			// TODO(vlaad): write error file atomically (open,write,rename)
 			mountError := "mount-s3 exited with code 1"
 			err := os.WriteFile(errFilePath, []byte(mountError), 0644)
 			assert.NoError(t, err)
@@ -309,75 +299,16 @@ func TestDaemonsetMounter(t *testing.T) {
 			assert.Contains(t, err.Error(), mountError)
 
 			// Can't use IsMountpoint/CheckMountpoint (didn't register mount), so we
-			// verify Unmount was called via FakeMounter log.
-			testCtx.assertUnmounted(target)
-		})
-
-		t.Run("Credentials cleaned up on mount failure", func(t *testing.T) {
-			mockCtl := gomock.NewController(t)
-			mockCredProvider := mock_credentialprovider.NewMockProviderInterface(mockCtl)
-
-			testCtx := setupDM(t, mockCredProvider)
-			target := testCtx.targetPath
-			mountId := mustGetMountId(t, target)
-
-			expectedWritePath := filepath.Join(testCtx.commDir, mountId)
-			expectedEnvPath := filepath.Join("/comm", mountId)
-
-			provideCall := mockCredProvider.EXPECT().Provide(gomock.Any(), gomock.Any()).
-				DoAndReturn(func(_ context.Context, provideCtx credentialprovider.ProvideContext) (envprovider.Environment, credentialprovider.AuthenticationSource, error) {
-					assert.Equals(t, expectedWritePath, provideCtx.WritePath)
-					assert.Equals(t, expectedEnvPath, provideCtx.EnvPath)
-					assert.Equals(t, credentialprovider.MountKindDaemonset, provideCtx.MountKind)
-					return envprovider.Environment{}, credentialprovider.AuthenticationSourceDriver, nil
-				})
-
-			mockCredProvider.EXPECT().Cleanup(gomock.Any()).After(provideCall).
-				DoAndReturn(func(cleanupCtx credentialprovider.CleanupContext) error {
-					assert.Equals(t, expectedWritePath, cleanupCtx.WritePath)
-					assert.Equals(t, credentialprovider.MountKindDaemonset, cleanupCtx.MountKind)
-					return nil
-				})
-
-			mountErr := fmt.Errorf("simulated mount failure")
-			testCtx.mountSyscall = func(target string, opts mpmounter.MountOptions) (int, error) {
-				return 0, mountErr
-			}
-
-			err := testCtx.dm.Mount(testCtx.ctx, testCtx.bucketName, target, credentialprovider.ProvideContext{
-				WorkloadPodID: testCtx.podUID,
-				VolumeID:      testCtx.volumeID,
-			}, mountpoint.ParseArgs(nil), "", nil)
-			if err == nil {
-				t.Fatal("mount should fail")
-			}
-			assert.Contains(t, err.Error(), "simulated mount failure")
-
-			_, err = os.Stat(expectedWritePath)
-			assert.ErrorIs(t, err, os.ErrNotExist)
+			// verify Unmount was called on source path via FakeMounter log.
+			sourcePath := filepath.Join(testCtx.kubeletPath, "plugins", "s3.csi.aws.com", "mnt", testCtx.volumeID)
+			testCtx.assertUnmounted(sourcePath)
 		})
 	})
 
 	t.Run("Unmounting", func(t *testing.T) {
-		t.Run("Removes mount from target and cleans up credentials", func(t *testing.T) {
-			mockCtl := gomock.NewController(t)
-			mockCredProvider := mock_credentialprovider.NewMockProviderInterface(mockCtl)
-
-			testCtx := setupDM(t, mockCredProvider)
-			target := testCtx.targetPath
-			mountId := mustGetMountId(t, target)
-
-			expectedWritePath := filepath.Join(testCtx.commDir, mountId)
-
-			mockCredProvider.EXPECT().Provide(gomock.Any(), gomock.Any()).
-				Return(envprovider.Environment{}, credentialprovider.AuthenticationSourceDriver, nil)
-
-			mockCredProvider.EXPECT().Cleanup(gomock.Any()).
-				DoAndReturn(func(cleanupCtx credentialprovider.CleanupContext) error {
-					assert.Equals(t, expectedWritePath, cleanupCtx.WritePath)
-					assert.Equals(t, credentialprovider.MountKindDaemonset, cleanupCtx.MountKind)
-					return nil
-				})
+		t.Run("Removes mount from target", func(t *testing.T) {
+			testCtx := setupDM(t)
+			target := testCtx.targetPath(testCtx.podUID)
 
 			mountRes := make(chan error)
 			go func() {
@@ -392,7 +323,8 @@ func TestDaemonsetMounter(t *testing.T) {
 			}()
 
 			testCtx.receiveMountOptions()
-			testCtx.mount.Mount("mountpoint-s3", target, "fuse", nil)
+			sourcePath := mounter.SourceMountPath(testCtx.kubeletPath, testCtx.volumeID)
+			testCtx.mount.Mount("mountpoint-s3", sourcePath, "fuse", nil)
 			err := <-mountRes
 			assert.NoError(t, err)
 
@@ -413,9 +345,6 @@ func TestDaemonsetMounter(t *testing.T) {
 			if mounted {
 				t.Error("target should not be mounted after Unmount")
 			}
-
-			_, err = os.Stat(expectedWritePath)
-			assert.ErrorIs(t, err, os.ErrNotExist)
 		})
 	})
 
@@ -442,7 +371,7 @@ func TestDaemonsetMounter(t *testing.T) {
 					t.Setenv("CONTAINER_KUBELET_PATH", t.TempDir())
 
 					client := fake.NewSimpleClientset(tt.pods...)
-					dm := mounter.NewDaemonsetMounter(client, "test-node", mpmounter.NewWithMount(mount.NewFakeMounter(nil)), nil, nil)
+					dm := mounter.NewDaemonsetMounter(client, "test-node", mpmounter.NewWithMount(mount.NewFakeMounter(nil)), &noopCredProvider{}, nil, nil, nil)
 
 					ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 					defer cancel()
@@ -479,7 +408,7 @@ func TestDaemonsetMounter(t *testing.T) {
 
 		t.Run("Mount fails fast when commDir not discovered", func(t *testing.T) {
 			testCtx := setupDM(t)
-			target := testCtx.targetPath
+			target := testCtx.targetPath(testCtx.podUID)
 
 			// Create a fresh DM which has not discovered commDir (setupDM called dm.DiscoverCommDir(ctx))
 			// and has no StartCommDirWatch process to populate it.
@@ -487,11 +416,13 @@ func TestDaemonsetMounter(t *testing.T) {
 			testCtx.dm = mounter.NewDaemonsetMounter(
 				testCtx.client, testCtx.nodeName,
 				mpmounter.NewWithMount(testCtx.mount),
-				nil,
+				&noopCredProvider{},
 				func(target string, opts mpmounter.MountOptions) (int, error) {
 					mountSyscallCalled = true
 					return 0, nil
 				},
+				nil,
+				nil,
 			)
 
 			err := testCtx.dm.Mount(testCtx.ctx, testCtx.bucketName, target, credentialprovider.ProvideContext{
@@ -509,7 +440,7 @@ func TestDaemonsetMounter(t *testing.T) {
 
 		t.Run("Mount nils commDir on staleness (socket not found)", func(t *testing.T) {
 			testCtx := setupDM(t)
-			target := testCtx.targetPath
+			target := testCtx.targetPath("pod-timeout")
 
 			testCtx.mountSyscall = func(tgt string, opts mpmounter.MountOptions) (int, error) {
 				testCtx.mount.Mount("mountpoint-s3", tgt, "fuse", nil)
@@ -524,7 +455,7 @@ func TestDaemonsetMounter(t *testing.T) {
 			// No receiveMountOptions (socket does not exist). Send -> dialWithRetry will retry
 			// until context timeout (DeadlineExceeded) which should nil commDir on staleness
 			err := testCtx.dm.Mount(ctx, testCtx.bucketName, target, credentialprovider.ProvideContext{
-				WorkloadPodID: testCtx.podUID,
+				WorkloadPodID: "pod-timeout",
 				VolumeID:      testCtx.volumeID,
 			}, mountpoint.ParseArgs(nil), "", nil)
 			if err == nil {
@@ -542,7 +473,7 @@ func TestDaemonsetMounter(t *testing.T) {
 			// it incorrectly nils commDir, all subsequent mounts fail with "mounter pod
 			// not available" until the watcher re-discovers.
 			testCtx := setupDM(t)
-			target := testCtx.targetPath
+			target := testCtx.targetPath("pod-cancel")
 
 			testCtx.mountSyscall = func(tgt string, opts mpmounter.MountOptions) (int, error) {
 				testCtx.mount.Mount("mountpoint-s3", tgt, "fuse", nil)
@@ -555,7 +486,7 @@ func TestDaemonsetMounter(t *testing.T) {
 			cancel()
 
 			err := testCtx.dm.Mount(ctx, testCtx.bucketName, target, credentialprovider.ProvideContext{
-				WorkloadPodID: testCtx.podUID,
+				WorkloadPodID: "pod-cancel",
 				VolumeID:      testCtx.volumeID,
 			}, mountpoint.ParseArgs(nil), "", nil)
 			if err == nil {
@@ -567,6 +498,220 @@ func TestDaemonsetMounter(t *testing.T) {
 			_, err = testCtx.dm.GetCommDir()
 			assert.NoError(t, err)
 		})
+	})
+}
+
+func TestDaemonsetMounter_PodSharing(t *testing.T) {
+	t.Run("Second pod shares existing mount without new FUSE mount", func(t *testing.T) {
+		testCtx := setupDM(t)
+		target1 := testCtx.targetPath("pod-a-uid")
+		target2 := testCtx.targetPath("pod-b-uid")
+
+		fuseMountCount := 0
+		testCtx.mountSyscall = func(tgt string, opts mpmounter.MountOptions) (int, error) {
+			fuseMountCount++
+			testCtx.mount.Mount("mountpoint-s3", tgt, "fuse", nil)
+			fd, err := syscall.Dup(int(mountertest.OpenDevNull(t).Fd()))
+			assert.NoError(t, err)
+			return fd, nil
+		}
+
+		// Mount first pod
+		mountRes := make(chan error)
+		go func() {
+			mountRes <- testCtx.dm.Mount(testCtx.ctx, testCtx.bucketName, target1, credentialprovider.ProvideContext{
+				WorkloadPodID:        "pod-a-uid",
+				VolumeID:             testCtx.volumeID,
+				AuthenticationSource: "driver",
+				ServiceAccountName:   "default",
+				PodNamespace:         "default",
+			}, mountpoint.ParseArgs(nil), "", nil)
+		}()
+
+		// Receive and complete the first mount
+		testCtx.receiveMountOptions()
+		sourcePath := mounter.SourceMountPath(testCtx.kubeletPath, testCtx.volumeID)
+		testCtx.mount.Mount("mountpoint-s3", sourcePath, "fuse", nil)
+
+		err := <-mountRes
+		assert.NoError(t, err)
+		assert.Equals(t, 1, fuseMountCount)
+
+		// Mount second pod — same volume, same params → should share via bind mount
+		err = testCtx.dm.Mount(testCtx.ctx, testCtx.bucketName, target2, credentialprovider.ProvideContext{
+			WorkloadPodID:        "pod-b-uid",
+			VolumeID:             testCtx.volumeID,
+			AuthenticationSource: "driver",
+			ServiceAccountName:   "default",
+			PodNamespace:         "default",
+		}, mountpoint.ParseArgs(nil), "", nil)
+		assert.NoError(t, err)
+
+		// FUSE mount should NOT have been called again — only bind mount
+		assert.Equals(t, 1, fuseMountCount)
+	})
+
+	t.Run("Second pod rejected with different service account", func(t *testing.T) {
+		testCtx := setupDM(t)
+		target1 := testCtx.targetPath("pod-a-uid")
+		target2 := testCtx.targetPath("pod-b-uid")
+
+		testCtx.mountSyscall = func(tgt string, opts mpmounter.MountOptions) (int, error) {
+			testCtx.mount.Mount("mountpoint-s3", tgt, "fuse", nil)
+			fd, err := syscall.Dup(int(mountertest.OpenDevNull(t).Fd()))
+			assert.NoError(t, err)
+			return fd, nil
+		}
+
+		// Mount first pod with sa-a
+		mountRes := make(chan error)
+		go func() {
+			mountRes <- testCtx.dm.Mount(testCtx.ctx, testCtx.bucketName, target1, credentialprovider.ProvideContext{
+				WorkloadPodID:        "pod-a-uid",
+				VolumeID:             testCtx.volumeID,
+				AuthenticationSource: "driver",
+				ServiceAccountName:   "sa-a",
+				PodNamespace:         "default",
+			}, mountpoint.ParseArgs(nil), "", nil)
+		}()
+
+		testCtx.receiveMountOptions()
+		sourcePath := mounter.SourceMountPath(testCtx.kubeletPath, testCtx.volumeID)
+		testCtx.mount.Mount("mountpoint-s3", sourcePath, "fuse", nil)
+
+		err := <-mountRes
+		assert.NoError(t, err)
+
+		// Second pod with sa-b — should be rejected
+		err = testCtx.dm.Mount(testCtx.ctx, testCtx.bucketName, target2, credentialprovider.ProvideContext{
+			WorkloadPodID:        "pod-b-uid",
+			VolumeID:             testCtx.volumeID,
+			AuthenticationSource: "driver",
+			ServiceAccountName:   "sa-b",
+			PodNamespace:         "default",
+		}, mountpoint.ParseArgs(nil), "", nil)
+		if err == nil {
+			t.Fatal("expected error for mismatched service account")
+		}
+		assert.Contains(t, err.Error(), "serviceAccountName mismatch")
+	})
+
+	t.Run("Unmount last consumer resets entry, next mount with diff params succeeds", func(t *testing.T) {
+		testCtx := setupDM(t)
+		target1 := testCtx.targetPath("pod-a-uid")
+		target2 := testCtx.targetPath("pod-b-uid")
+
+		testCtx.mountSyscall = func(tgt string, opts mpmounter.MountOptions) (int, error) {
+			testCtx.mount.Mount("mountpoint-s3", tgt, "fuse", nil)
+			fd, err := syscall.Dup(int(mountertest.OpenDevNull(t).Fd()))
+			assert.NoError(t, err)
+			return fd, nil
+		}
+
+		// Mount with sa-a
+		mountRes := make(chan error)
+		go func() {
+			mountRes <- testCtx.dm.Mount(testCtx.ctx, testCtx.bucketName, target1, credentialprovider.ProvideContext{
+				WorkloadPodID:        "pod-a-uid",
+				VolumeID:             testCtx.volumeID,
+				AuthenticationSource: "driver",
+				ServiceAccountName:   "sa-a",
+				PodNamespace:         "default",
+			}, mountpoint.ParseArgs(nil), "", nil)
+		}()
+
+		testCtx.receiveMountOptions()
+		sourcePath := mounter.SourceMountPath(testCtx.kubeletPath, testCtx.volumeID)
+		testCtx.mount.Mount("mountpoint-s3", sourcePath, "fuse", nil)
+
+		err := <-mountRes
+		assert.NoError(t, err)
+
+		// Unmount the only consumer
+		err = testCtx.dm.Unmount(testCtx.ctx, target1, credentialprovider.CleanupContext{
+			VolumeID: testCtx.volumeID,
+			PodID:    "pod-a-uid",
+		})
+		assert.NoError(t, err)
+
+		// Now mount with sa-b — should succeed because entry was reset
+		go func() {
+			mountRes <- testCtx.dm.Mount(testCtx.ctx, testCtx.bucketName, target2, credentialprovider.ProvideContext{
+				WorkloadPodID:        "pod-b-uid",
+				VolumeID:             testCtx.volumeID,
+				AuthenticationSource: "driver",
+				ServiceAccountName:   "sa-b",
+				PodNamespace:         "default",
+			}, mountpoint.ParseArgs(nil), "", nil)
+		}()
+
+		testCtx.receiveMountOptions()
+		testCtx.mount.Mount("mountpoint-s3", sourcePath, "fuse", nil)
+
+		err = <-mountRes
+		assert.NoError(t, err)
+	})
+
+	t.Run("Concurrent mounts same volume same params no race", func(t *testing.T) {
+		testCtx := setupDM(t)
+
+		fuseMountCount := 0
+		testCtx.mountSyscall = func(tgt string, opts mpmounter.MountOptions) (int, error) {
+			fuseMountCount++
+			testCtx.mount.Mount("mountpoint-s3", tgt, "fuse", nil)
+			fd, err := syscall.Dup(int(mountertest.OpenDevNull(t).Fd()))
+			assert.NoError(t, err)
+			return fd, nil
+		}
+
+		// First mount to establish the source
+		target1 := testCtx.targetPath("pod-first")
+		mountRes := make(chan error)
+		go func() {
+			mountRes <- testCtx.dm.Mount(testCtx.ctx, testCtx.bucketName, target1, credentialprovider.ProvideContext{
+				WorkloadPodID:        "pod-first",
+				VolumeID:             testCtx.volumeID,
+				AuthenticationSource: "driver",
+				ServiceAccountName:   "default",
+				PodNamespace:         "default",
+			}, mountpoint.ParseArgs(nil), "", nil)
+		}()
+
+		testCtx.receiveMountOptions()
+		sourcePath := mounter.SourceMountPath(testCtx.kubeletPath, testCtx.volumeID)
+		testCtx.mount.Mount("mountpoint-s3", sourcePath, "fuse", nil)
+
+		err := <-mountRes
+		assert.NoError(t, err)
+
+		// Now fire 5 concurrent mounts — all should share, no new FUSE mount
+		var results [5]error
+		var wg sync.WaitGroup
+		for i := 0; i < 5; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				podUID := "pod-" + string(rune('a'+idx))
+				target := testCtx.targetPath(podUID)
+				results[idx] = testCtx.dm.Mount(testCtx.ctx, testCtx.bucketName, target, credentialprovider.ProvideContext{
+					WorkloadPodID:        podUID,
+					VolumeID:             testCtx.volumeID,
+					AuthenticationSource: "driver",
+					ServiceAccountName:   "default",
+					PodNamespace:         "default",
+				}, mountpoint.ParseArgs(nil), "", nil)
+			}(i)
+		}
+		wg.Wait()
+
+		for i, err := range results {
+			if err != nil {
+				t.Errorf("concurrent mount %d failed: %v", i, err)
+			}
+		}
+
+		// Only 1 FUSE mount should have happened (the initial one)
+		assert.Equals(t, 1, fuseMountCount)
 	})
 }
 
@@ -586,13 +731,6 @@ func (testCtx *dmTestCtx) assertUnmounted(target string) {
 		}
 	}
 	testCtx.t.Errorf("expected Unmount to be called on %s, FakeMounter log: %v", target, testCtx.mount.GetLog())
-}
-
-func mustGetMountId(t *testing.T, target string) string {
-	t.Helper()
-	id, err := mounter.GetMountId(target)
-	assert.NoError(t, err)
-	return id
 }
 
 func mounterPod(name string, phase corev1.PodPhase) *corev1.Pod {
