@@ -383,3 +383,9 @@ func findMountpointPods(ctx context.Context, cs clientset.Interface, volumeName 
 
 	return matchingPods, nil
 }
+
+// isDaemonsetMounterMode returns true if the MOUNTER_MODE environment variable is set to "daemonset",
+// indicating the driver is deployed in daemonset architecture mode.
+func isDaemonsetMounterMode(_ context.Context, _ *framework.Framework) bool {
+	return os.Getenv("MOUNTER_MODE") == "daemonset"
+}
