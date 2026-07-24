@@ -619,9 +619,10 @@ func (t *s3CSIPodSharingDaemonsetTestSuite) DefineTests(driver storageframework.
 			// mount-s3 process should be running while pod is mounted
 			ginkgo.By("Verifying mount-s3 process exists while pod is mounted")
 			dumpMountpointProcesses(ctx, f, targetNode, "while pod mounted")
-			mpProcessCountBefore := countMountpointProcessesForVolume(ctx, f, targetNode, bucketName)
-			gomega.Expect(mpProcessCountBefore).To(gomega.Equal(1),
-				"expected exactly 1 mount-s3 process for bucket %s while pod is mounted, got %d", bucketName, mpProcessCountBefore)
+			framework.Gomega().Eventually(ctx, func(ctx context.Context) (int, error) {
+				count := countMountpointProcessesForVolume(ctx, f, targetNode, bucketName)
+				return count, nil
+			}).WithTimeout(60 * time.Second).WithPolling(5 * time.Second).Should(gomega.Equal(1))
 
 			// Delete the pod — last consumer, should clean up meta AND source mount
 			ginkgo.By("Deleting the last pod and verifying meta file and source mount are removed")
@@ -644,9 +645,10 @@ func (t *s3CSIPodSharingDaemonsetTestSuite) DefineTests(driver storageframework.
 			// Verify mount-s3 process for this volume has terminated in the mounter pod
 			ginkgo.By("Verifying mount-s3 process terminated after last consumer unmounts")
 			dumpMountpointProcesses(ctx, f, targetNode, "after last consumer unmounts")
-			mpProcessCountAfter := countMountpointProcessesForVolume(ctx, f, targetNode, bucketName)
-			gomega.Expect(mpProcessCountAfter).To(gomega.Equal(0),
-				"expected 0 mount-s3 processes for bucket %s after last consumer unmounts, got %d", bucketName, mpProcessCountAfter)
+			framework.Gomega().Eventually(ctx, func(ctx context.Context) (int, error) {
+				count := countMountpointProcessesForVolume(ctx, f, targetNode, bucketName)
+				return count, nil
+			}).WithTimeout(60 * time.Second).WithPolling(5 * time.Second).Should(gomega.Equal(0))
 		})
 
 		ginkgo.It("should recover from mounter pod crash with fresh source mount for new pods", func(ctx context.Context) {
@@ -1296,34 +1298,31 @@ func waitForCSINodePodStable(ctx context.Context, f *framework.Framework, nodeNa
 }
 
 // countMountpointProcessesForVolume execs into the mounter pod on the given node and counts
-// mount-s3 processes for the specific bucket. Uses /proc/*/cmdline
-// mount-s3's first arg is the bucket name.
+// mount-s3 processes for the specific bucket. Uses /proc/*/cmdline.
+// Returns the count or -1 on error. Callers should use Eventually for retry logic.
 func countMountpointProcessesForVolume(ctx context.Context, f *framework.Framework, nodeName, bucketName string) int {
-	var result int
-	framework.Gomega().Eventually(ctx, func(ctx context.Context) (int, error) {
-		pods, err := f.ClientSet.CoreV1().Pods(csiDriverDaemonSetNamespace).List(ctx, metav1.ListOptions{
-			LabelSelector: "app=s3-csi-daemonset-mounter",
-			FieldSelector: "spec.nodeName=" + nodeName,
-		})
-		if err != nil || len(pods.Items) == 0 {
-			return -1, fmt.Errorf("mounter pod not found on node %s", nodeName)
-		}
+	pods, err := f.ClientSet.CoreV1().Pods(csiDriverDaemonSetNamespace).List(ctx, metav1.ListOptions{
+		LabelSelector: "app=s3-csi-daemonset-mounter",
+		FieldSelector: "spec.nodeName=" + nodeName,
+	})
+	if err != nil || len(pods.Items) == 0 {
+		framework.Logf("mounter pod not found on node %s (retrying): %v", nodeName, err)
+		return -1
+	}
 
-		mounterPod := &pods.Items[0]
-		// Count mount-s3 processes for this specific bucket using case pattern match (no grep, avoids self-match)
-		cmd := fmt.Sprintf("count=0; for p in /proc/[0-9]*/cmdline; do line=$(cat $p 2>/dev/null | tr '\\0' ' '); case \"$line\" in '/mountpoint-s3/bin/mount-s3 %s '*) count=$((count+1));; esac; done; echo $count", bucketName)
-		stdout, _, err := execInPodWithNamespace(ctx, f, csiDriverDaemonSetNamespace, mounterPod.Name, "mounter", []string{"/bin/sh", "-c", cmd})
-		if err != nil {
-			return -1, fmt.Errorf("exec failed: %w", err)
-		}
+	mounterPod := &pods.Items[0]
+	// Count mount-s3 processes for this specific bucket using case pattern match (no grep, avoids self-match)
+	cmd := fmt.Sprintf("count=0; for p in /proc/[0-9]*/cmdline; do line=$(cat $p 2>/dev/null | tr '\\0' ' '); case \"$line\" in '/mountpoint-s3/bin/mount-s3 %s '*) count=$((count+1));; esac; done; echo $count", bucketName)
+	stdout, _, err := execInPodWithNamespace(ctx, f, csiDriverDaemonSetNamespace, mounterPod.Name, "mounter", []string{"/bin/sh", "-c", cmd})
+	if err != nil {
+		framework.Logf("exec into mounter pod failed (retrying): %v", err)
+		return -1
+	}
 
-		count := 0
-		fmt.Sscanf(strings.TrimSpace(stdout), "%d", &count)
-		framework.Logf("mount-s3 process count for bucket %s on node %s: %d", bucketName, nodeName, count)
-		result = count
-		return count, nil
-	}).WithTimeout(30 * time.Second).WithPolling(5 * time.Second).Should(gomega.BeNumerically(">=", 0))
-	return result
+	count := 0
+	fmt.Sscanf(strings.TrimSpace(stdout), "%d", &count)
+	framework.Logf("mount-s3 process count for bucket %s on node %s: %d", bucketName, nodeName, count)
+	return count
 }
 
 // dumpMountpointProcesses logs all mount-s3 processes running in the mounter pod on the given node.
