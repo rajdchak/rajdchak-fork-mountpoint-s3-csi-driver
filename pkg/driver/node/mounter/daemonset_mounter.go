@@ -251,32 +251,41 @@ func (dm *DaemonsetMounter) mountOrShareSource(ctx context.Context, bucketName s
 
 	// New mount: FUSE mount at source, then bind to target.
 	mountId := volumeID // In sharing mode, one mount per volume
+
+	// Persist meta to disk BEFORE mounting so that RebuildMountMap can find this volume
+	// if the driver crashes between fuseMount and the end of this function. If the mount
+	// fails, we clean up the meta file. An orphan meta file (crash after meta-write but
+	// before fuseMount) is harmless — RebuildMountMap detects no matching mount in
+	// /proc/self/mountinfo and deletes the stale meta file.
+	entry.Params = incomingParams
+	if err := WriteMeta(dm.kubeletPath, entry); err != nil {
+		klog.Errorf("DaemonsetMounter: failed to write meta for volume %s: %v (non-fatal)", volumeID, err)
+	}
+
 	if err := dm.fuseMount(ctx, bucketName, sourcePath, mountId, args, userEnv, credsEnv); err != nil {
 		dm.cleanupCredentials(commDir, volumeID, credentialCtx.ToCleanupCtx())
+		dm.mountMap.Delete(volumeID)
+		RemoveMeta(dm.kubeletPath, volumeID)
 		return err
 	}
 
 	// Bind mount source → target.
 	if err := dm.BindMount(sourcePath, target); err != nil {
-		// Cleanup source and credentials on bind failure.
+		// Cleanup source, credentials, map entry, and meta on bind failure.
 		dm.mount.Unmount(sourcePath)
 		os.Remove(sourcePath)
 		dm.cleanupCredentials(commDir, volumeID, credentialCtx.ToCleanupCtx())
+		dm.mountMap.Delete(volumeID)
+		RemoveMeta(dm.kubeletPath, volumeID)
 		return err
 	}
 
 	// Populate the entry.
 	entry.SourcePath = sourcePath
 	entry.MountID = mountId
-	entry.Params = incomingParams
 	entry.RefCount = 1
 	entry.Targets = []string{target}
 	entry.initialized = true
-
-	// Persist meta to disk for recovery after driver restart.
-	if err := WriteMeta(dm.kubeletPath, entry); err != nil {
-		klog.Errorf("DaemonsetMounter: failed to write meta for volume %s: %v (non-fatal)", volumeID, err)
-	}
 
 	klog.V(4).Infof("DaemonsetMounter: new shared mount for volume %s at source %s → %s", volumeID, sourcePath, target)
 	return nil
