@@ -250,7 +250,6 @@ func (dm *DaemonsetMounter) mountOrShareSource(ctx context.Context, bucketName s
 	}
 
 	// New mount: FUSE mount at source, then bind to target.
-	mountId := volumeID // In sharing mode, one mount per volume
 
 	// Persist meta to disk BEFORE mounting so that RebuildMountMap can find this volume
 	// if the driver crashes between fuseMount and the end of this function. If the mount
@@ -262,7 +261,7 @@ func (dm *DaemonsetMounter) mountOrShareSource(ctx context.Context, bucketName s
 		klog.Errorf("DaemonsetMounter: failed to write meta for volume %s: %v (non-fatal)", volumeID, err)
 	}
 
-	if err := dm.fuseMount(ctx, bucketName, sourcePath, mountId, args, userEnv, credsEnv); err != nil {
+	if err := dm.fuseMount(ctx, bucketName, sourcePath, volumeID, args, userEnv, credsEnv); err != nil {
 		dm.cleanupCredentials(commDir, volumeID, credentialCtx.ToCleanupCtx())
 		dm.mountMap.Delete(volumeID)
 		RemoveMeta(dm.kubeletPath, volumeID)
@@ -282,7 +281,6 @@ func (dm *DaemonsetMounter) mountOrShareSource(ctx context.Context, bucketName s
 
 	// Populate the entry.
 	entry.SourcePath = sourcePath
-	entry.MountID = mountId
 	entry.RefCount = 1
 	entry.Targets = []string{target}
 	entry.initialized = true
@@ -294,7 +292,7 @@ func (dm *DaemonsetMounter) mountOrShareSource(ctx context.Context, bucketName s
 // fuseMount performs the FUSE mount + FD send + wait cycle at the given path.
 // Credentials are already provisioned by the caller (Mount).
 func (dm *DaemonsetMounter) fuseMount(ctx context.Context, bucketName string, mountPath string,
-	mountId string, args mountpoint.Args, userEnv envprovider.Environment, credsEnv envprovider.Environment) error {
+	volumeID string, args mountpoint.Args, userEnv envprovider.Environment, credsEnv envprovider.Environment) error {
 
 	commDir, err := dm.GetCommDir()
 	if err != nil {
@@ -339,10 +337,10 @@ func (dm *DaemonsetMounter) fuseMount(ctx context.Context, bucketName string, mo
 	}
 
 	sockPath := filepath.Join(commDir, MountSockName)
-	errFilePath := filepath.Join(commDir, GetErrorFileName(mountId))
+	errFilePath := filepath.Join(commDir, GetErrorFileName(volumeID))
 	os.Remove(errFilePath)
 
-	klog.V(4).Infof("DaemonsetMounter: sending mount options (mount %s) to %s", mountId, sockPath)
+	klog.V(4).Infof("DaemonsetMounter: sending mount options (mount %s) to %s", volumeID, sockPath)
 
 	sendCtx, sendCancel := context.WithTimeout(ctx, sendOptionsTimeout)
 	defer sendCancel()
@@ -352,7 +350,7 @@ func (dm *DaemonsetMounter) fuseMount(ctx context.Context, bucketName string, mo
 		BucketName: bucketName,
 		Args:       args.SortedList(),
 		Env:        env.List(),
-		VolumeId:   mountId,
+		VolumeId:   volumeID,
 	})
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) || os.IsPermission(err) || errors.Is(err, context.DeadlineExceeded) {
@@ -363,13 +361,13 @@ func (dm *DaemonsetMounter) fuseMount(ctx context.Context, bucketName string, mo
 			default:
 			}
 		}
-		return fmt.Errorf("failed to send mount options (mount %s): %w. %s", mountId, err, helpMessageForGettingMounterLogs())
+		return fmt.Errorf("failed to send mount options (mount %s): %w. %s", volumeID, err, helpMessageForGettingMounterLogs())
 	}
 
 	dm.closeFUSEDevFD(fd)
 	fdClosed = true
 
-	err = dm.waitForMount(ctx, mountPath, mountId, errFilePath)
+	err = dm.waitForMount(ctx, mountPath, volumeID, errFilePath)
 	if err != nil {
 		return err
 	}
@@ -427,8 +425,8 @@ func (dm *DaemonsetMounter) releaseTarget(target string, volumeID string) error 
 
 		// Clean up error file and credentials before unmount (ensures retrying cleanup on failure).
 		if dir := dm.commDir.Load(); dir != nil {
-			os.Remove(filepath.Join(*dir, GetErrorFileName(entry.MountID)))
-			if err := dm.cleanupCredentials(*dir, entry.MountID, credentialprovider.CleanupContext{
+			os.Remove(filepath.Join(*dir, GetErrorFileName(entry.VolumeID)))
+			if err := dm.cleanupCredentials(*dir, entry.VolumeID, credentialprovider.CleanupContext{
 				VolumeID:  volumeID,
 				MountKind: credentialprovider.MountKindDaemonset,
 			}); err != nil {
@@ -453,9 +451,9 @@ func (dm *DaemonsetMounter) releaseTarget(target string, volumeID string) error 
 	return nil
 }
 
-// GetErrorFileName returns the error file name for a given mount ID.
-func GetErrorFileName(mountId string) string {
-	return mountId + MountErrorSuffix
+// GetErrorFileName returns the error file name for a given volume ID.
+func GetErrorFileName(volumeID string) string {
+	return volumeID + MountErrorSuffix
 }
 
 // helpMessageForGettingMounterLogs returns a help message with a command to get mounter logs.
@@ -515,25 +513,25 @@ func (dm *DaemonsetMounter) mountSyscallWithDefault(target string, opts mpmounte
 }
 
 // provideCredentials creates a per-mount credential directory and provisions credentials into it.
-func (dm *DaemonsetMounter) provideCredentials(ctx context.Context, commDir, mountId string, credentialCtx *credentialprovider.ProvideContext) (envprovider.Environment, error) {
-	mountCredDir := filepath.Join(commDir, mountId)
+func (dm *DaemonsetMounter) provideCredentials(ctx context.Context, commDir, volumeID string, credentialCtx *credentialprovider.ProvideContext) (envprovider.Environment, error) {
+	mountCredDir := filepath.Join(commDir, volumeID)
 	if err := os.MkdirAll(mountCredDir, credentialprovider.CredentialDirPerm); err != nil {
 		return nil, fmt.Errorf("failed to create credential directory %q: %w", mountCredDir, err)
 	}
 	credentialCtx.WritePath = mountCredDir
-	credentialCtx.EnvPath = filepath.Join("/comm", mountId)
+	credentialCtx.EnvPath = filepath.Join("/comm", volumeID)
 	credentialCtx.MountKind = credentialprovider.MountKindDaemonset
 
 	env, _, err := dm.credProvider.Provide(ctx, *credentialCtx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to provide credentials for mount %s: %w", mountId, err)
+		return nil, fmt.Errorf("failed to provide credentials for mount %s: %w", volumeID, err)
 	}
 	return env, nil
 }
 
 // cleanupCredentials removes the per-mount credential directory.
-func (dm *DaemonsetMounter) cleanupCredentials(commDir, mountId string, cleanupCtx credentialprovider.CleanupContext) error {
-	mountCredDir := filepath.Join(commDir, mountId)
+func (dm *DaemonsetMounter) cleanupCredentials(commDir, volumeID string, cleanupCtx credentialprovider.CleanupContext) error {
+	mountCredDir := filepath.Join(commDir, volumeID)
 	cleanupCtx.WritePath = mountCredDir
 	cleanupCtx.MountKind = credentialprovider.MountKindDaemonset
 	if err := dm.credProvider.Cleanup(cleanupCtx); err != nil {
@@ -688,9 +686,8 @@ func (dm *DaemonsetMounter) RebuildMountMap() error {
 			continue
 		}
 
-		// Derive SourcePath and MountID from VolumeID (they are not persisted)
+		// Derive SourcePath from VolumeID (not persisted, always computable)
 		sourcePath := SourceMountPath(dm.kubeletPath, meta.VolumeID)
-		mountID := meta.VolumeID // MountID == VolumeID in sharing mode
 
 		// Find the source mount in mountinfo
 		sourceMI := findMountByPath(mountInfos, sourcePath)
@@ -707,7 +704,6 @@ func (dm *DaemonsetMounter) RebuildMountMap() error {
 		entry, _ := dm.mountMap.GetOrCreate(meta.VolumeID)
 		entry.mu.Lock()
 		entry.SourcePath = sourcePath
-		entry.MountID = mountID
 		entry.Params = MountParams{
 			MountOptions:             meta.MountOptions,
 			AuthenticationSource:     meta.AuthenticationSource,
@@ -760,7 +756,7 @@ func (dm *DaemonsetMounter) tryDiscoverCommDir(ctx context.Context) (string, err
 }
 
 // waitForMount waits until Mountpoint is serving at target or an error occurs.
-func (dm *DaemonsetMounter) waitForMount(parentCtx context.Context, target, mountId, errFilePath string) error {
+func (dm *DaemonsetMounter) waitForMount(parentCtx context.Context, target, volumeID, errFilePath string) error {
 	ctx, cancel := context.WithTimeout(parentCtx, mountReadyTimeout)
 	defer cancel()
 
@@ -774,7 +770,7 @@ func (dm *DaemonsetMounter) waitForMount(parentCtx context.Context, target, moun
 				return false, nil
 			}
 			os.Remove(errFilePath)
-			mountResultCh <- fmt.Errorf("Mountpoint for mount %s failed: %s", mountId, string(content))
+			mountResultCh <- fmt.Errorf("Mountpoint for mount %s failed: %s", volumeID, string(content))
 			return true, nil
 		})
 	}()
@@ -786,7 +782,7 @@ func (dm *DaemonsetMounter) waitForMount(parentCtx context.Context, target, moun
 			return isMounted, nil
 		})
 		if err != nil {
-			mountResultCh <- fmt.Errorf("timed out waiting for Mountpoint to serve mount %s at %s. %s", mountId, target, helpMessageForGettingMounterLogs())
+			mountResultCh <- fmt.Errorf("timed out waiting for Mountpoint to serve mount %s at %s. %s", volumeID, target, helpMessageForGettingMounterLogs())
 		} else {
 			mountResultCh <- nil
 		}

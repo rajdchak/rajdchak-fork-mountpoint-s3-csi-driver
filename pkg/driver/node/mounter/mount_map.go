@@ -85,11 +85,9 @@ type MountEntry struct {
 	// SourcePath is the path where the FUSE mount lives (one Mountpoint process).
 	SourcePath string
 
-	// VolumeID is the CSI volume ID (volumeHandle from the PV).
+	// VolumeID is the PV name, used as the sharing key, credential directory name,
+	// error file name, and mount identifier when communicating with the secondary daemonset.
 	VolumeID string
-
-	// MountID is the identifier used when communicating with the secondary daemonset.
-	MountID string
 
 	// Params records the mount parameters for validation of subsequent share requests.
 	Params MountParams

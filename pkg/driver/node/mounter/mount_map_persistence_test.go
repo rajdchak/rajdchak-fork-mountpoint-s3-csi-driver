@@ -31,7 +31,6 @@ func TestWriteMeta_CreatesFile(t *testing.T) {
 
 	entry := &MountEntry{
 		VolumeID:   "vol-abc123",
-		MountID:    "vol-abc123",
 		SourcePath: filepath.Join(kubeletPath, "plugins", "s3.csi.aws.com", "mnt", "vol-abc123"),
 		Params: MountParams{
 			MountOptions:             []string{"--allow-other", "--region=us-east-1"},
@@ -77,7 +76,6 @@ func TestWriteMeta_OverwritesExisting(t *testing.T) {
 
 	entry1 := &MountEntry{
 		VolumeID:   "vol-overwrite",
-		MountID:    "vol-overwrite",
 		SourcePath: "/source-1",
 		Params:     MountParams{ServiceAccountName: "sa-first"},
 	}
@@ -86,7 +84,6 @@ func TestWriteMeta_OverwritesExisting(t *testing.T) {
 
 	entry2 := &MountEntry{
 		VolumeID:   "vol-overwrite",
-		MountID:    "vol-overwrite",
 		SourcePath: "/source-2",
 		Params:     MountParams{ServiceAccountName: "sa-second"},
 	}
@@ -101,13 +98,14 @@ func TestWriteMeta_OverwritesExisting(t *testing.T) {
 func TestWriteMeta_CreatesDirectoryIfMissing(t *testing.T) {
 	kubeletPath := t.TempDir()
 
+	entry := &MountEntry{VolumeID: "vol-mkdir", SourcePath: "/source"}
+
 	metaDir := filepath.Join(kubeletPath, "plugins", "s3.csi.aws.com", "mnt")
 	_, err := os.Stat(metaDir)
 	if !os.IsNotExist(err) {
 		t.Fatal("expected meta directory to not exist initially")
 	}
 
-	entry := &MountEntry{VolumeID: "vol-mkdir", MountID: "vol-mkdir", SourcePath: "/source"}
 	err = WriteMeta(kubeletPath, entry)
 	assert.NoError(t, err)
 
@@ -121,7 +119,7 @@ func TestWriteMeta_CreatesDirectoryIfMissing(t *testing.T) {
 func TestRemoveMeta_RemovesFile(t *testing.T) {
 	kubeletPath := t.TempDir()
 
-	entry := &MountEntry{VolumeID: "vol-remove", MountID: "vol-remove", SourcePath: "/source"}
+	entry := &MountEntry{VolumeID: "vol-remove", SourcePath: "/source"}
 	err := WriteMeta(kubeletPath, entry)
 	assert.NoError(t, err)
 
@@ -147,7 +145,6 @@ func TestReadMeta_ParsesCorrectly(t *testing.T) {
 
 	entry := &MountEntry{
 		VolumeID:   "vol-read",
-		MountID:    "vol-read",
 		SourcePath: "/my/source/path",
 		Params: MountParams{
 			MountOptions:             []string{"--read-only"},
@@ -207,8 +204,8 @@ func TestWriteMeta_EmptyMountOptions(t *testing.T) {
 	kubeletPath := t.TempDir()
 
 	entry := &MountEntry{
-		VolumeID: "vol-empty-opts", MountID: "vol-empty-opts", SourcePath: "/source",
-		Params: MountParams{MountOptions: nil, AuthenticationSource: "driver"},
+		VolumeID: "vol-empty-opts",
+		Params:   MountParams{MountOptions: nil, AuthenticationSource: "driver"},
 	}
 	err := WriteMeta(kubeletPath, entry)
 	assert.NoError(t, err)
@@ -224,8 +221,8 @@ func TestWriteMeta_EmptyEKSRoleARN_OmittedInJSON(t *testing.T) {
 	kubeletPath := t.TempDir()
 
 	entry := &MountEntry{
-		VolumeID: "vol-no-arn", MountID: "vol-no-arn", SourcePath: "/source",
-		Params: MountParams{AuthenticationSource: "driver", ServiceAccountEKSRoleARN: ""},
+		VolumeID: "vol-no-arn",
+		Params:   MountParams{AuthenticationSource: "driver", ServiceAccountEKSRoleARN: ""},
 	}
 	err := WriteMeta(kubeletPath, entry)
 	assert.NoError(t, err)
@@ -364,8 +361,9 @@ func TestRebuildMountMap_CleansUpDeadSourceMounts(t *testing.T) {
 	sourcePath := SourceMountPath(kubeletPath, "vol-dead")
 
 	entry := &MountEntry{
-		VolumeID: "vol-dead", MountID: "vol-dead", SourcePath: sourcePath,
-		Params: MountParams{AuthenticationSource: "driver", ServiceAccountName: "default"},
+		VolumeID:   "vol-dead",
+		SourcePath: sourcePath,
+		Params:     MountParams{AuthenticationSource: "driver", ServiceAccountName: "default"},
 	}
 	err := WriteMeta(kubeletPath, entry)
 	assert.NoError(t, err)
@@ -394,7 +392,8 @@ func TestRebuildMountMap_RecoversLiveSourceWithBindMounts(t *testing.T) {
 	sourcePath := SourceMountPath(kubeletPath, "vol-live")
 
 	entry := &MountEntry{
-		VolumeID: "vol-live", MountID: "vol-live", SourcePath: sourcePath,
+		VolumeID:   "vol-live",
+		SourcePath: sourcePath,
 		Params: MountParams{
 			MountOptions:             []string{"--allow-other"},
 			AuthenticationSource:     "pod",
@@ -424,7 +423,6 @@ func TestRebuildMountMap_RecoversLiveSourceWithBindMounts(t *testing.T) {
 	}
 
 	assert.Equals(t, sourcePath, recovered.SourcePath)
-	assert.Equals(t, "vol-live", recovered.MountID)
 	assert.Equals(t, 3, recovered.RefCount)
 	assert.Equals(t, 3, len(recovered.Targets))
 	assert.Equals(t, true, recovered.initialized)
@@ -444,8 +442,9 @@ func TestRebuildMountMap_SourceWithNoBindMounts(t *testing.T) {
 	sourcePath := SourceMountPath(kubeletPath, "vol-orphan")
 
 	entry := &MountEntry{
-		VolumeID: "vol-orphan", MountID: "vol-orphan", SourcePath: sourcePath,
-		Params: MountParams{AuthenticationSource: "driver"},
+		VolumeID:   "vol-orphan",
+		SourcePath: sourcePath,
+		Params:     MountParams{AuthenticationSource: "driver"},
 	}
 	err := WriteMeta(kubeletPath, entry)
 	assert.NoError(t, err)
@@ -474,12 +473,14 @@ func TestRebuildMountMap_MultipleVolumes(t *testing.T) {
 	sourceB := SourceMountPath(kubeletPath, "vol-b")
 
 	entryA := &MountEntry{
-		VolumeID: "vol-a", MountID: "vol-a", SourcePath: sourceA,
-		Params: MountParams{ServiceAccountName: "sa-a"},
+		VolumeID:   "vol-a",
+		SourcePath: sourceA,
+		Params:     MountParams{ServiceAccountName: "sa-a"},
 	}
 	entryB := &MountEntry{
-		VolumeID: "vol-b", MountID: "vol-b", SourcePath: sourceB,
-		Params: MountParams{ServiceAccountName: "sa-b"},
+		VolumeID:   "vol-b",
+		SourcePath: sourceB,
+		Params:     MountParams{ServiceAccountName: "sa-b"},
 	}
 	err := WriteMeta(kubeletPath, entryA)
 	assert.NoError(t, err)
@@ -514,7 +515,6 @@ func TestWriteReadMetaCycle(t *testing.T) {
 
 	entry := &MountEntry{
 		VolumeID:   "vol-roundtrip",
-		MountID:    "vol-roundtrip",
 		SourcePath: SourceMountPath(kubeletPath, "vol-roundtrip"),
 		Params: MountParams{
 			MountOptions:             []string{"--allow-other", "--prefix=data/", "--read-only"},
@@ -547,7 +547,7 @@ func TestRemoveMeta_OnlyRemovesTargetVolume(t *testing.T) {
 	kubeletPath := t.TempDir()
 
 	for _, volID := range []string{"vol-keep", "vol-remove", "vol-also-keep"} {
-		entry := &MountEntry{VolumeID: volID, MountID: volID, SourcePath: "/source/" + volID}
+		entry := &MountEntry{VolumeID: volID, SourcePath: "/source/" + volID}
 		err := WriteMeta(kubeletPath, entry)
 		assert.NoError(t, err)
 	}

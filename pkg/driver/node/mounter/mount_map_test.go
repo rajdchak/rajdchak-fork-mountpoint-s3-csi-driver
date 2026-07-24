@@ -177,7 +177,6 @@ func TestMountEntry_ResetAllowsDifferentParams(t *testing.T) {
 	entry, _ := m.GetOrCreate("vol-1")
 	entry.mu.Lock()
 	entry.SourcePath = "/source"
-	entry.MountID = "mount-1"
 	entry.Params = MountParams{ServiceAccountName: "sa-a", AuthenticationSource: "driver"}
 	entry.RefCount = 1
 	entry.Targets = []string{"/target-a"}
@@ -189,7 +188,6 @@ func TestMountEntry_ResetAllowsDifferentParams(t *testing.T) {
 	entry.RefCount--
 	entry.initialized = false
 	entry.SourcePath = ""
-	entry.MountID = ""
 	entry.Params = MountParams{}
 	entry.Targets = nil
 	entry.mu.Unlock()
@@ -206,7 +204,6 @@ func TestMountEntry_ResetAllowsDifferentParams(t *testing.T) {
 	// Simulate new mount with different params
 	newParams := MountParams{ServiceAccountName: "sa-b", AuthenticationSource: "pod"}
 	entry2.SourcePath = "/new-source"
-	entry2.MountID = "mount-2"
 	entry2.Params = newParams
 	entry2.RefCount = 1
 	entry2.Targets = []string{"/target-b"}
