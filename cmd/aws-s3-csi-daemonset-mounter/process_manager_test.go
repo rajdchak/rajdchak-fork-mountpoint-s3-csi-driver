@@ -265,9 +265,11 @@ func TestProcessManager_Launch_MultipleProcesses(t *testing.T) {
 
 	for i, id := range []string{"mount-a", "mount-b", "mount-c"} {
 		dev := mountertest.OpenDevNull(t)
+		// Each mount gets a distinct UID, mirroring csi-node's per-mount UID allocation.
+		uid := uint32(65536 + i)
 		err := pm.Launch(id, "/usr/bin/mount-s3", mountoptions.Options{
-			Uid:        65536,
-			Gid:        65536,
+			Uid:        uid,
+			Gid:        uid,
 			Fd:         int(dev.Fd()),
 			BucketName: fmt.Sprintf("bucket-%d", i),
 		})
@@ -352,6 +354,61 @@ func TestProcessManager_Launch_DuplicateMountId_Rejected(t *testing.T) {
 
 	dev3 := mountertest.OpenDevNull(t)
 	err = pm.Launch("same-mount", "/usr/bin/mount-s3", mountoptions.Options{
+		Uid:        65536,
+		Gid:        65536,
+		Fd:         int(dev3.Fd()),
+		BucketName: "bucket",
+	})
+	assert.NoError(t, err)
+
+	fr.handles[1].Exit(0, "")
+	pm.Shutdown()
+}
+
+func TestProcessManager_Launch_DuplicateUID_Rejected(t *testing.T) {
+	commDir := t.TempDir()
+	fr := &fakeProcessRunner{}
+	pm := NewProcessManager(commDir, fr, memoryLimit{strategy: memoryLimitNone})
+
+	dev1 := mountertest.OpenDevNull(t)
+	err := pm.Launch("mount-a", "/usr/bin/mount-s3", mountoptions.Options{
+		Uid:        65536,
+		Gid:        65536,
+		Fd:         int(dev1.Fd()),
+		BucketName: "bucket",
+	})
+	assert.NoError(t, err)
+
+	// A different mountId carrying the same UID must be rejected: two Mountpoints under one UID
+	// would defeat the per-mount kernel isolation.
+	dev2 := mountertest.OpenDevNull(t)
+	err = pm.Launch("mount-b", "/usr/bin/mount-s3", mountoptions.Options{
+		Uid:        65536,
+		Gid:        65536,
+		Fd:         int(dev2.Fd()),
+		BucketName: "bucket",
+	})
+	if err == nil {
+		t.Fatal("Expected error for duplicate UID, got nil")
+	}
+
+	// Only the first process is tracked.
+	pm.mu.Lock()
+	assert.Equals(t, 1, len(pm.processes))
+	assert.Equals(t, "mount-a", pm.uids[65536])
+	pm.mu.Unlock()
+
+	// Once the holder exits, the UID frees up and another mount can claim it.
+	fr.handles[0].Exit(0, "")
+	time.Sleep(10 * time.Millisecond)
+
+	pm.mu.Lock()
+	_, stillTaken := pm.uids[65536]
+	assert.Equals(t, false, stillTaken)
+	pm.mu.Unlock()
+
+	dev3 := mountertest.OpenDevNull(t)
+	err = pm.Launch("mount-b", "/usr/bin/mount-s3", mountoptions.Options{
 		Uid:        65536,
 		Gid:        65536,
 		Fd:         int(dev3.Fd()),

@@ -33,6 +33,7 @@ type ProcessManager struct {
 
 	mu        sync.Mutex
 	processes map[string]ProcessHandle // mountId -> process handle
+	uids      map[uint32]string        // uid -> mountId, so no two live mounts share a UID
 	wg        sync.WaitGroup           // tracks waiter goroutines
 }
 
@@ -42,6 +43,7 @@ func NewProcessManager(commDir string, runner ProcessRunner, memory memoryLimit)
 		runner:    runner,
 		memory:    memory,
 		processes: make(map[string]ProcessHandle),
+		uids:      make(map[uint32]string),
 	}
 }
 
@@ -100,6 +102,14 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 		fuseDev.Close()
 		return fmt.Errorf("mount %s already has a running process", mountId)
 	}
+	// csi-node allocates a unique UID per mount, so a UID already serving another mount means a bug
+	// or a stale/duplicate request. Reject it rather than run two Mountpoints under one UID, which
+	// would defeat the per-mount kernel isolation.
+	if otherMountId, taken := pm.uids[options.Uid]; taken {
+		pm.mu.Unlock()
+		fuseDev.Close()
+		return fmt.Errorf("refusing to launch mount %s with UID %d already in use by mount %s", mountId, options.Uid, otherMountId)
+	}
 
 	handle, err := pm.runner.Start(cmd)
 	if err != nil {
@@ -112,6 +122,7 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 	fuseDev.Close()
 
 	pm.processes[mountId] = handle
+	pm.uids[options.Uid] = mountId
 	pm.mu.Unlock()
 
 	klog.Infof("Launched Mountpoint for mount %s (pid %d)", mountId, handle.Pid())
@@ -123,6 +134,7 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 
 		pm.mu.Lock()
 		delete(pm.processes, mountId)
+		delete(pm.uids, options.Uid)
 		pm.mu.Unlock()
 
 		if exitCode != 0 {
